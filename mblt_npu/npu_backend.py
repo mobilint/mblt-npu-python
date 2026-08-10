@@ -10,17 +10,45 @@ from .logging import log_model_details
 
 logger = logging.getLogger(__name__)
 
-# Keyed by the enum's own `.value`, because that is exactly what the setters
-# serialize (`f"{v.cluster.value}:{v.core.value}"`). The previous maps were keyed
-# by ordinal — 0, 1, 2, 3 — and the values are not ordinals: Cluster0 is 65536 and
-# Core0 is 1. So a Cluster round trip raised KeyError, which the getter's
-# `except: pass` swallowed into an empty list, and a Core round trip silently
-# returned the *next* core (core_map[1] is Core1, not Core0). Only callers who
-# happened to pass plain ints hit a working path.
-#
-# Built from the enums rather than written out, so the two cannot drift again.
-cluster_map = {c.value: c for c in (Cluster.Cluster0, Cluster.Cluster1)}
-core_map = {c.value: c for c in (Core.Core0, Core.Core1, Core.Core2, Core.Core3)}
+
+def _enum_value(value: Any) -> int:
+    """Return an integer enum value across qbruntime binding versions."""
+
+    while hasattr(value, "value"):
+        value = value.value
+    return int(value)
+
+
+# qbruntime has shipped both a Python enum wrapping a native enum and a direct
+# enum binding. Peel every ``.value`` layer so serialized fields are stable
+# integers across both forms (Cluster0 is 65536; Core0 is 1).
+cluster_map = {
+    _enum_value(cluster): cluster for cluster in (Cluster.Cluster0, Cluster.Cluster1)
+}
+core_map = {
+    _enum_value(core): core for core in (Core.Core0, Core.Core1, Core.Core2, Core.Core3)
+}
+
+DEFAULT_TARGET_DEVICE = "aries-rb"
+"""Default supported Mobilint NPU board."""
+
+_TARGET_DEVICE_ALIASES = {
+    # Configurations written before board-specific target devices were exposed
+    # used these generic product names. Keep them readable, but always serialize
+    # one of the supported board identifiers below.
+    "aries": "aries-rb",
+    "regulus": "regulus-ra",
+}
+
+
+def normalize_target_device(target_device: str) -> str:
+    """Return a supported board identifier, accepting legacy generic product names."""
+
+    if not isinstance(target_device, str):
+        raise TypeError(
+            f"target_device must be a string, got {type(target_device).__name__}."
+        )
+    return _TARGET_DEVICE_ALIASES.get(target_device.lower(), target_device.lower())
 
 
 class MobilintNPUBackend:
@@ -32,9 +60,10 @@ class MobilintNPUBackend:
     four cores and four modes; Regulus has one core and only single. Encoding that
     in types is what turns a late `StatusCode(16)` into an argument error.
 
-    Instantiating this class directly still works and yields an Aries backend, so
-    existing callers — `MobilintNPUBackend(...)` in mblt_melotts and
-    `MobilintNPUBackend.from_dict(...)` in mblt_transformers — are unaffected.
+    Instantiating this class directly selects a backend from ``target_device``.
+    The default is ``aries-rb``; ``regulus-ra`` and ``regulus-rb`` select the
+    Regulus implementation. Existing generic ``aries`` and ``regulus`` config
+    values remain accepted as input compatibility aliases.
     """
 
     # Aries geometry. Overridden per product.
@@ -43,16 +72,17 @@ class MobilintNPUBackend:
 
     #: Core modes this product accepts. Empty on the base class, which never runs.
     supported_core_modes: tuple = ()
-    #: Value of `target_device` that selects this subclass.
-    target_device: str = ""
+    #: Default board when this subclass is instantiated directly.
+    default_target_device: str = DEFAULT_TARGET_DEVICE
+    #: Board identifiers accepted by this backend implementation.
+    supported_target_devices: tuple[str, ...] = ()
 
     def __new__(cls, *args, **kwargs):
-        # Dispatch, rather than making this an ABC, so that a bare
-        # MobilintNPUBackend(...) keeps working for the callers that predate the
-        # split into products. `target_device` picks the subclass; the default
-        # preserves the previous behaviour exactly.
+        # MobilintNPUBackend(...) remains the public construction point. The
+        # board identifier picks its implementation.
         if cls is MobilintNPUBackend:
-            device = kwargs.get("target_device", "aries")
+            requested_device = kwargs.get("target_device") or DEFAULT_TARGET_DEVICE
+            device = normalize_target_device(requested_device)
             cls = backend_class_for(device)
         return super().__new__(cls)
 
@@ -65,10 +95,21 @@ class MobilintNPUBackend:
         target_clusters: Optional[List[Union[int, "Cluster"]]] = None,
         revision: Optional[str] = None,
         commit_hash: Optional[str] = None,
-        target_device: str = "aries",
+        target_device: str | None = None,
         **kwargs,
     ):
+        resolved_target_device = normalize_target_device(
+            target_device or self.default_target_device
+        )
+        if resolved_target_device not in self.supported_target_devices:
+            raise ValueError(
+                f"target_device {resolved_target_device!r} is not supported by "
+                f"{type(self).__name__}; expected one of "
+                f"{', '.join(self.supported_target_devices)}."
+            )
+
         self.name_or_path: str = ""  # will be populated in MobilintModelMixin
+        self.target_device = resolved_target_device
         self.revision = revision
         self._commit_hash = commit_hash
         self.mxq_path = mxq_path
@@ -275,15 +316,13 @@ class MobilintNPUBackend:
         for s in self._target_cores_serialized:
             try:
                 c_val, r_val = map(int, s.split(":"))
-                # CoreId takes no constructor arguments in the qbruntime binding;
-                # the fields are assigned afterwards. Calling CoreId(cluster, core)
-                # raised TypeError, which the except below swallowed — so a value
-                # the setter had accepted came back as an empty list, with only a
-                # log line to say so.
-                core_id = CoreId()
-                core_id.cluster = cluster_map[c_val]
-                core_id.core = core_map[r_val]
-                result.append(core_id)
+                if c_val in (0, 1):
+                    cluster = (Cluster.Cluster0, Cluster.Cluster1)[c_val]
+                    core = (Core.Core0, Core.Core1, Core.Core2, Core.Core3)[r_val]
+                else:
+                    cluster = cluster_map[c_val]
+                    core = core_map[r_val]
+                result.append(CoreId(cluster, core))
             except Exception as e:
                 # Raising rather than warning-and-skipping: this used to drop the
                 # entry and return a shorter list, so a caller who asked for two
@@ -301,7 +340,21 @@ class MobilintNPUBackend:
         serialized = []
         for v in values:
             if isinstance(v, CoreId):
-                serialized.append(f"{v.cluster.value}:{v.core.value}")
+                cluster_index = next(
+                    index
+                    for index, cluster in enumerate(
+                        (Cluster.Cluster0, Cluster.Cluster1)
+                    )
+                    if _enum_value(cluster) == _enum_value(v.cluster)
+                )
+                core_index = next(
+                    index
+                    for index, core in enumerate(
+                        (Core.Core0, Core.Core1, Core.Core2, Core.Core3)
+                    )
+                    if _enum_value(core) == _enum_value(v.core)
+                )
+                serialized.append(f"{cluster_index}:{core_index}")
             elif isinstance(v, str):
                 if ":" in v:
                     serialized.append(v)
@@ -321,7 +374,11 @@ class MobilintNPUBackend:
         for s in self._target_clusters_serialized:
             try:
                 c_val = int(s)
-                result.append(cluster_map[c_val])
+                result.append(
+                    (Cluster.Cluster0, Cluster.Cluster1)[c_val]
+                    if c_val in (0, 1)
+                    else cluster_map[c_val]
+                )
             except Exception as e:
                 raise ValueError(
                     f"cannot deserialize target cluster {s!r}: expected one of "
@@ -334,15 +391,22 @@ class MobilintNPUBackend:
         serialized = []
         for v in values:
             if isinstance(v, Cluster):
-                serialized.append(v.value)
+                serialized.append(
+                    next(
+                        index
+                        for index, cluster in enumerate(
+                            (Cluster.Cluster0, Cluster.Cluster1)
+                        )
+                        if _enum_value(cluster) == _enum_value(v)
+                    )
+                )
             elif isinstance(v, int):
-                # Callers pass 0 and 1 meaning "first cluster", "second cluster" —
-                # `set_multi_core_mode([0, 1])` in the vision wrapper's ancestor did
-                # exactly that. Normalize to the enum value so both spellings
-                # deserialize, instead of one of them working by accident.
+                # Callers pass 0 and 1 meaning "first cluster", "second cluster".
+                # Preserve this public serialized form while accepting native enum
+                # values from older callers as well.
                 ordinals = [Cluster.Cluster0, Cluster.Cluster1]
                 if 0 <= v < len(ordinals):
-                    serialized.append(ordinals[v].value)
+                    serialized.append(v)
                 elif v in cluster_map:
                     serialized.append(v)
                 else:
@@ -384,7 +448,7 @@ class MobilintNPUBackend:
         if cls is not MobilintNPUBackend:
             data = dict(data)
             data.pop(f"{prefix}target_device", None)
-            data[f"{prefix}target_device"] = cls.target_device
+            data[f"{prefix}target_device"] = cls.default_target_device
         if f"{p}target_cores" in data.keys() and f"{p}target_clusters" in data.keys():
             logger.warning(f"{p}target_cores and {p}target_clusters are both set!")
             logger.warning(
@@ -403,9 +467,7 @@ class MobilintNPUBackend:
             target_clusters=data.pop(f"{p}target_clusters", None),
             revision=data.pop(f"{p}revision", None),
             commit_hash=data.pop(f"{p}commit_hash", None),
-            # Default "aries" so a config written before products existed keeps
-            # resolving to the backend it always got.
-            target_device=data.pop(f"{p}target_device", "aries"),
+            target_device=data.pop(f"{p}target_device", None),
         )
 
 
@@ -415,7 +477,8 @@ class MobilintAriesBackend(MobilintNPUBackend):
     num_of_clusters = 2
     num_of_cores_in_cluster = 4
     supported_core_modes = ("auto", "single", "multi", "global4", "global8")
-    target_device = "aries"
+    default_target_device = "aries-rb"
+    supported_target_devices = ("aries-rb",)
 
     def _configure_core_mode(self, mc: "ModelConfig") -> None:
         if self.core_mode == "auto":
@@ -458,7 +521,8 @@ class MobilintRegulusBackend(MobilintNPUBackend):
     num_of_clusters = 1
     num_of_cores_in_cluster = 1
     supported_core_modes = ("auto", "single")
-    target_device = "regulus"
+    default_target_device = "regulus-ra"
+    supported_target_devices = ("regulus-ra", "regulus-rb")
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -466,7 +530,7 @@ class MobilintRegulusBackend(MobilintNPUBackend):
             raise ValueError(
                 "target_clusters is meaningless on regulus, which has a single "
                 f"core: got {self._target_clusters_serialized}. Remove it, or use "
-                "target_device='aries'."
+                "target_device='aries-rb'."
             )
 
     def _configure_core_mode(self, mc: "ModelConfig") -> None:
@@ -481,14 +545,16 @@ class MobilintRegulusBackend(MobilintNPUBackend):
 #: adding a product is one entry and an unknown one is an error naming the
 #: choices, instead of silently behaving like Aries.
 BACKEND_CLASSES = {
-    MobilintAriesBackend.target_device: MobilintAriesBackend,
-    MobilintRegulusBackend.target_device: MobilintRegulusBackend,
+    "aries-rb": MobilintAriesBackend,
+    "regulus-ra": MobilintRegulusBackend,
+    "regulus-rb": MobilintRegulusBackend,
 }
 
 
 def backend_class_for(target_device: str):
+    normalized_target_device = normalize_target_device(target_device)
     try:
-        return BACKEND_CLASSES[target_device]
+        return BACKEND_CLASSES[normalized_target_device]
     except KeyError:
         raise ValueError(
             f"unknown target_device {target_device!r}; "

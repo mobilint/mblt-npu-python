@@ -11,10 +11,12 @@ log_model_details reads a MobilintNPUBackend's fields.
 
 from .npu_backend import (
     BACKEND_CLASSES,
+    DEFAULT_TARGET_DEVICE,
     MobilintAriesBackend,
     MobilintNPUBackend,
     MobilintRegulusBackend,
     backend_class_for,
+    normalize_target_device,
 )
 from .logging import log_model_details
 
@@ -22,9 +24,11 @@ __version__ = "0.0.1"
 
 __all__ = [
     "BACKEND_CLASSES",
+    "DEFAULT_TARGET_DEVICE",
     "MobilintAriesBackend",
     "MobilintNPUBackend",
     "MobilintRegulusBackend",
     "backend_class_for",
     "log_model_details",
+    "normalize_target_device",
 ]

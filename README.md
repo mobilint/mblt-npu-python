@@ -40,8 +40,10 @@ finally:
 ```
 
 `MobilintNPUBackend` selects the appropriate implementation from
-`target_device` (default: `"aries"`). Use `MobilintAriesBackend` or
-`MobilintRegulusBackend` when an application needs to name a product explicitly.
+`target_device` (default: `"aries-rb"`). `"aries-rb"` selects
+`MobilintAriesBackend`; `"regulus-ra"` and `"regulus-rb"` select
+`MobilintRegulusBackend`. The former generic values `"aries"` and `"regulus"`
+remain accepted when loading older configurations.
 `backend_class_for()` and `BACKEND_CLASSES` are available for integrations that
 need to inspect the supported targets.
 
