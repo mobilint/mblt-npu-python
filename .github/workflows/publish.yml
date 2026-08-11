@@ -40,7 +40,9 @@ jobs:
     name: Publish to TestPyPI 🧪
     needs: [build]
     runs-on: ubuntu-latest
-    environment: testpypi
+    environment:
+      name: Release - TestPyPI
+      url: https://test.pypi.org/p/mblt-npu
     permissions:
       id-token: write
     steps:
