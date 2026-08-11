@@ -1,0 +1,58 @@
+[build-system]
+requires = ["setuptools>=70.0.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mblt-npu-python"
+dynamic = ["version"]
+description = "Shared NPU access for the Mobilint Python packages"
+readme = "README.md"
+dependencies = [
+    "mobilint-qb-runtime>=1.0.0",
+    "huggingface-hub",
+]
+requires-python = ">=3.10,<3.13"
+license = { text = "BSD-3-Clause" }
+authors = [{ name = "Mobilint" }]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: BSD License",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+[project.urls]
+Home = "https://www.mobilint.com/"
+Repository = "https://github.com/mobilint/mblt-npu-python"
+
+[tool.setuptools]
+packages = { find = { where = ["."], include = ["mblt_npu", "mblt_npu.*"] } }
+
+[tool.setuptools.dynamic]
+version = { attr = "mblt_npu.__version__" }
+
+[project.optional-dependencies]
+# The shared pytest options and fixtures live in this package so the four
+# repositories do not each carry a copy that drifts — the same argument as
+# npu_backend. But `pytest_plugin` imports pytest, so that dependency is declared
+# here rather than left undeclared in a runtime wheel.
+test = ["pytest"]
+onnxruntime = ["onnxruntime"]
+
+# No [project.entry-points.pytest11]. Registering the plugin there AND star-importing
+# it from each tests/conftest.py registers pytest_addoption twice, which pytest
+# rejects with `option names {'--mxq-path'} already added`. Dropping the conftest
+# instead would leave a source checkout with no fixtures until the package is
+# installed, so the conftest is the mechanism and pytest is a declared extra rather
+# than an undeclared import.
+
+[dependency-groups]
+dev = [
+    "pre-commit",
+    "pytest",
+]
