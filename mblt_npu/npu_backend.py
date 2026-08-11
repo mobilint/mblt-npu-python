@@ -304,6 +304,20 @@ class MobilintNPUBackend:
     def launch(self):
         self.mxq_model.launch(self.acc)
 
+    def __call__(self, x: Any) -> Any:
+        """Run inference with the loaded MXQ model.
+
+        This compatibility entry point is used by the Vision engine and mirrors
+        the historical Model Zoo backend contract.
+        """
+
+        return self.mxq_model.infer(x)
+
+    def get_dtype(self) -> str:
+        """Return the loaded model input data type as a runtime string."""
+
+        return str(self.mxq_model.get_model_input_data_type())
+
     def dispose(self):
         self.mxq_model.dispose()
 
@@ -490,12 +504,9 @@ class MobilintAriesBackend(MobilintNPUBackend):
         elif self.core_mode == "single":
             cores = self.target_cores
             if cores:
-                mc.set_single_core_mode(cores)
+                mc.set_single_core_mode(core_ids=cores)
             else:
-                # The two accepted signatures are (int) and (list[CoreId]); the
-                # previous `set_single_core_mode(None, target_cores)` matched
-                # neither and raised TypeError on every default-constructed
-                # backend, since "single" is the default core_mode.
+                # With no explicit cores, let qbruntime allocate one local core.
                 mc.set_single_core_mode(1)
         elif self.core_mode == "multi":
             mc.set_multi_core_mode(self.target_clusters)
@@ -538,7 +549,10 @@ class MobilintRegulusBackend(MobilintNPUBackend):
             mc.set_auto_core_mode()
         else:
             cores = self.target_cores
-            mc.set_single_core_mode(cores if cores else 1)
+            if cores:
+                mc.set_single_core_mode(core_ids=cores)
+            else:
+                mc.set_single_core_mode(1)
 
 
 #: target_device -> backend class. A mapping rather than a chain of ifs so that

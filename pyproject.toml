@@ -43,6 +43,7 @@ version = { attr = "mblt_npu.__version__" }
 # npu_backend. But `pytest_plugin` imports pytest, so that dependency is declared
 # here rather than left undeclared in a runtime wheel.
 test = ["pytest"]
+onnxruntime = ["onnxruntime"]
 
 # No [project.entry-points.pytest11]. Registering the plugin there AND star-importing
 # it from each tests/conftest.py registers pytest_addoption twice, which pytest

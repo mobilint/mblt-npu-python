@@ -1,11 +1,11 @@
 # Mobilint NPU Python
 
-Shared runtime support for applications that run MXQ models on Mobilint NPUs.
+Shared runtime support for applications that run MXQ models on Mobilint NPUs or ONNX models through ONNX Runtime.
 `mblt-npu-python` provides the common backend, device-selection rules, Hugging Face
 artifact resolution, and model-detail logging used by Mobilint Python packages. It
 is a library dependency, rather than an end-user model catalog.
 
-Version `0.0.1` is the initial standalone release.
+Version `0.0.0` is the initial standalone release.
 
 `logging` ships here rather than with its only caller because the two are mutually
 dependent — `npu_backend` imports `log_model_details`, and `log_model_details` reads
@@ -46,6 +46,23 @@ finally:
 remain accepted when loading older configurations.
 `backend_class_for()` and `BACKEND_CLASSES` are available for integrations that
 need to inspect the supported targets.
+
+For ONNX inference, install the optional runtime extra and use `ONNXBackend`:
+
+```bash
+pip install "mblt-npu-python[onnxruntime]"
+```
+
+```python
+from mblt_npu import ONNXBackend
+
+backend = ONNXBackend("model.onnx")
+backend.create()
+outputs = backend({"images": input_array})
+backend.dispose()
+```
+
+`ONNXBackend` imports `onnxruntime` only when it creates a session.
 
 Most users should access the backend through a model package such as
 [`mblt-vision-python`](https://github.com/mobilint/mblt-vision-python), which owns

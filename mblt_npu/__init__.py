@@ -19,6 +19,7 @@ from .npu_backend import (
     normalize_target_device,
 )
 from .logging import log_model_details
+from .onnx_backend import ONNXBackend
 
 __version__ = "0.0.0"
 
@@ -28,6 +29,7 @@ __all__ = [
     "MobilintAriesBackend",
     "MobilintNPUBackend",
     "MobilintRegulusBackend",
+    "ONNXBackend",
     "backend_class_for",
     "log_model_details",
     "normalize_target_device",

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import Any, cast
+
 import pytest
 
 from mblt_npu import MobilintAriesBackend, MobilintNPUBackend, MobilintRegulusBackend
@@ -66,3 +68,20 @@ def test_legacy_core_and_cluster_assignments_round_trip() -> None:
     assert single_core.to_dict()["target_cores"] == ["0:0"]
     assert len(cluster.target_clusters) == 1
     assert cluster.to_dict()["target_clusters"] == [0]
+
+
+def test_backend_exposes_vision_runtime_compatibility_methods() -> None:
+    """Keep the callable inference and input-dtype APIs used by Vision."""
+
+    class _Model:
+        def infer(self, value: object) -> object:
+            return ("output", value)
+
+        def get_model_input_data_type(self) -> str:
+            return "DataType.Uint8"
+
+    backend = MobilintNPUBackend()
+    backend.mxq_model = cast(Any, _Model())
+
+    assert backend("input") == ("output", "input")
+    assert backend.get_dtype() == "DataType.Uint8"
