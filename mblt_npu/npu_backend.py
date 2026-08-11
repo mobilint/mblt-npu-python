@@ -1,6 +1,6 @@
 import logging
 import os
-from typing import Any, Dict, List, Literal, Optional, Union
+from typing import Any, Dict, List, Literal, Optional, Sequence, Union
 
 from huggingface_hub import HfApi, hf_hub_download
 from huggingface_hub.errors import EntryNotFoundError
@@ -98,7 +98,7 @@ class MobilintNPUBackend:
         dev_no: int = 0,
         core_mode: Literal["auto", "single", "multi", "global4", "global8"] = "single",
         target_cores: Optional[List[Union[str, "CoreId"]]] = None,
-        target_clusters: Optional[List[Union[int, "Cluster"]]] = None,
+        target_clusters: Optional[Sequence[Union[int, "Cluster"]]] = None,
         revision: Optional[str] = None,
         commit_hash: Optional[str] = None,
         target_device: str | None = None,
@@ -176,7 +176,7 @@ class MobilintNPUBackend:
                         revision=revision,
                     )
                 except EntryNotFoundError:
-                    cached = self._find_cached_mxq(name_or_path, mxq_path)
+                    cached = self._find_cached_mxq(name_or_path, mxq_path, revision)
                     if cached is not None:
                         return cached
                     mxq_candidate = self._find_mxq_from_hub(
@@ -242,7 +242,9 @@ class MobilintNPUBackend:
         return None
 
     @staticmethod
-    def _find_cached_mxq(repo_id: str, mxq_path: str) -> Optional[str]:
+    def _find_cached_mxq(
+        repo_id: str, mxq_path: str, revision: Optional[str] = None
+    ) -> Optional[str]:
         if not repo_id or "/" not in repo_id:
             return None
 
@@ -262,7 +264,10 @@ class MobilintNPUBackend:
 
         rel_candidates = [mxq_path, os.path.basename(mxq_path)]
         try:
-            for snapshot in os.listdir(snapshots_dir):
+            snapshots = os.listdir(snapshots_dir)
+            if revision is not None:
+                snapshots = [snapshot for snapshot in snapshots if snapshot == revision]
+            for snapshot in snapshots:
                 snapshot_dir = os.path.join(snapshots_dir, snapshot)
                 if not os.path.isdir(snapshot_dir):
                     continue
@@ -419,7 +424,7 @@ class MobilintNPUBackend:
         return result
 
     @target_clusters.setter
-    def target_clusters(self, values: List[Union[int, "Cluster"]]):
+    def target_clusters(self, values: Sequence[Union[int, "Cluster"]]):
         serialized = []
         for v in values:
             if isinstance(v, Cluster):
@@ -454,9 +459,12 @@ class MobilintNPUBackend:
     def to_dict(self, prefix="") -> Dict[str, Any]:
         p = prefix
         result = {
+            "name_or_path": self.name_or_path,
             f"{p}mxq_path": self.mxq_path,
             f"{p}dev_no": self.dev_no,
             f"{p}core_mode": self.core_mode,
+            f"{p}revision": self.revision,
+            f"{p}commit_hash": self._commit_hash,
             f"{p}target_device": self.target_device,
         }
 
@@ -579,6 +587,17 @@ class MobilintRegulusBackend(MobilintNPUBackend):
                 "target_clusters is meaningless on regulus, which has a single "
                 f"core: got {self._target_clusters_serialized}. Remove it, or use "
                 "target_device='aries-rb'."
+            )
+        cores = self.target_cores
+        expected_cluster = _enum_value(Cluster.Cluster0)
+        expected_core = _enum_value(Core.Core0)
+        if len(cores) > 1 or any(
+            _enum_value(core.cluster) != expected_cluster
+            or _enum_value(core.core) != expected_core
+            for core in cores
+        ):
+            raise ValueError(
+                "target_cores on regulus may select only its sole core (0:0)."
             )
 
     def _configure_core_mode(self, mc: "ModelConfig") -> None:

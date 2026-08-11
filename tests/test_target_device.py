@@ -61,6 +61,21 @@ def test_regulus_subclass_round_trip_preserves_regulus_rb() -> None:
     assert restored.target_device == "regulus-rb"
 
 
+def test_regulus_rejects_non_local_core_selection() -> None:
+    """Reject Aries-only core IDs before they reach the Regulus runtime."""
+
+    with pytest.raises(ValueError, match="sole core"):
+        MobilintRegulusBackend(target_cores=["1:3"])
+
+
+def test_regulus_accepts_its_sole_explicit_core() -> None:
+    """Retain support for selecting Regulus's single local core explicitly."""
+
+    backend = MobilintRegulusBackend(target_cores=["0:0"])
+
+    assert backend.to_dict()["target_cores"] == ["0:0"]
+
+
 def test_from_dict_does_not_consume_callers_configuration() -> None:
     """Leave reusable serialized backend configuration untouched."""
 
@@ -77,6 +92,23 @@ def test_from_dict_does_not_consume_callers_configuration() -> None:
     assert configuration == original_configuration
 
 
+def test_backend_round_trip_preserves_hub_identity() -> None:
+    """Keep repository and pin information needed for deterministic downloads."""
+
+    original = MobilintNPUBackend(
+        mxq_path="aries-rb/model.mxq",
+        target_device="aries-rb",
+        revision="release-1",
+        commit_hash="abc123",
+        name_or_path="example",
+    )
+    restored = MobilintNPUBackend.from_dict(original.to_dict())
+
+    assert restored.name_or_path == "example"
+    assert restored.revision == "release-1"
+    assert restored._commit_hash == "abc123"
+
+
 @pytest.mark.parametrize("target_clusters", [[0, 0], [1, 1], [0]])
 def test_global8_requires_both_distinct_aries_clusters(
     target_clusters: list[int],
@@ -90,7 +122,7 @@ def test_global8_requires_both_distinct_aries_clusters(
     backend = MobilintAriesBackend(core_mode="global8", target_clusters=target_clusters)
 
     with pytest.raises(ValueError, match="both Aries clusters"):
-        backend._configure_core_mode(_ModelConfig())
+        backend._configure_core_mode(cast(Any, _ModelConfig()))
 
 
 @pytest.mark.parametrize(
@@ -205,6 +237,31 @@ def test_cached_mxq_lookup_rejects_unrelated_artifacts(
 
     assert (
         MobilintNPUBackend._find_cached_mxq("mobilint/example", "requested.mxq") is None
+    )
+
+
+def test_cached_mxq_lookup_respects_an_explicit_revision(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Never use a matching cached MXQ from a different pinned snapshot."""
+
+    cache_root = tmp_path / "hub"
+    cached_other_revision = (
+        cache_root
+        / "models--mobilint--example"
+        / "snapshots"
+        / "other-commit"
+        / "model.mxq"
+    )
+    cached_other_revision.parent.mkdir(parents=True)
+    cached_other_revision.touch()
+    monkeypatch.setenv("HUGGINGFACE_HUB_CACHE", str(cache_root))
+
+    assert (
+        MobilintNPUBackend._find_cached_mxq(
+            "mobilint/example", "model.mxq", revision="pinned-commit"
+        )
+        is None
     )
 
 
