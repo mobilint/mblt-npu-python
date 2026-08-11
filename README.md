@@ -18,7 +18,8 @@ pip install mblt-npu-python
 ```
 
 This package requires a supported Linux environment with
-[`mobilint-qb-runtime`](https://pypi.org/project/mobilint-qb-runtime/) available.
+[`mobilint-qb-runtime`](https://pypi.org/project/mobilint-qb-runtime/) available
+and Python 3.10 through 3.12.
 
 ## Public API
 

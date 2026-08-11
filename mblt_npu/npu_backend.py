@@ -81,7 +81,13 @@ class MobilintNPUBackend:
         # MobilintNPUBackend(...) remains the public construction point. The
         # board identifier picks its implementation.
         if cls is MobilintNPUBackend:
-            requested_device = kwargs.get("target_device") or DEFAULT_TARGET_DEVICE
+            # ``target_device`` is the eighth positional parameter of
+            # ``__init__`` as well as a keyword argument. Respect either form
+            # before selecting the product-specific implementation.
+            requested_device = kwargs.get("target_device")
+            if requested_device is None and len(args) > 7:
+                requested_device = args[7]
+            requested_device = requested_device or DEFAULT_TARGET_DEVICE
             device = normalize_target_device(requested_device)
             cls = backend_class_for(device)
         return super().__new__(cls)
@@ -108,7 +114,10 @@ class MobilintNPUBackend:
                 f"{', '.join(self.supported_target_devices)}."
             )
 
-        self.name_or_path: str = ""  # will be populated in MobilintModelMixin
+        # ``from_dict`` supplies a serialized repository name through ``kwargs``.
+        # Keep it so an MXQ path can still be resolved from the Hub after a
+        # backend round trip; model mixins may replace it later when applicable.
+        self.name_or_path: str = kwargs.get("name_or_path", "")
         self.target_device = resolved_target_device
         self.revision = revision
         self._commit_hash = commit_hash
@@ -164,12 +173,15 @@ class MobilintNPUBackend:
                     return hf_hub_download(
                         repo_id=name_or_path,
                         filename=mxq_path,
+                        revision=revision,
                     )
                 except EntryNotFoundError:
                     cached = self._find_cached_mxq(name_or_path, mxq_path)
                     if cached is not None:
                         return cached
-                    mxq_candidate = self._find_mxq_from_hub(name_or_path, mxq_path)
+                    mxq_candidate = self._find_mxq_from_hub(
+                        name_or_path, mxq_path, revision
+                    )
                     if mxq_candidate is None:
                         raise
                     return hf_hub_download(
@@ -261,18 +273,14 @@ class MobilintNPUBackend:
         except OSError:
             return None
 
-        # Last resort: find any mxq in snapshots
-        for root, _, files in os.walk(snapshots_dir):
-            for name in files:
-                if name.endswith(".mxq"):
-                    return os.path.join(root, name)
-
         return None
 
     @staticmethod
-    def _find_mxq_from_hub(repo_id: str, mxq_path: str) -> Optional[str]:
+    def _find_mxq_from_hub(
+        repo_id: str, mxq_path: str, revision: Optional[str] = None
+    ) -> Optional[str]:
         try:
-            files = HfApi().list_repo_files(repo_id=repo_id)
+            files = HfApi().list_repo_files(repo_id=repo_id, revision=revision)
         except Exception:
             return None
 
@@ -336,7 +344,17 @@ class MobilintNPUBackend:
                 else:
                     cluster = cluster_map[c_val]
                     core = core_map[r_val]
-                result.append(CoreId(cluster, core))
+                core_id_factory: Any = CoreId
+                try:
+                    # qbruntime's current binding exposes a no-argument
+                    # constructor, although older type stubs declare only the
+                    # legacy two-argument form.
+                    core_id = core_id_factory()
+                    core_id.cluster = cluster
+                    core_id.core = core
+                except TypeError:
+                    core_id = CoreId(cluster, core)
+                result.append(core_id)
             except Exception as e:
                 # Raising rather than warning-and-skipping: this used to drop the
                 # entry and return a shorter list, so a caller who asked for two
@@ -455,14 +473,22 @@ class MobilintNPUBackend:
 
         Called as `MobilintNPUBackend.from_dict(...)`, `cls` is the base and
         `__new__` picks the subclass from `target_device`. Called on a subclass,
-        that subclass wins — a caller who asked for Regulus explicitly should not
-        have a stale `target_device` in the dict silently override them.
+        a serialized board supported by that subclass is retained; a board for a
+        different backend falls back to the subclass default.
         """
         p = prefix
+        data = dict(data)
         if cls is not MobilintNPUBackend:
-            data = dict(data)
-            data.pop(f"{prefix}target_device", None)
-            data[f"{prefix}target_device"] = cls.default_target_device
+            serialized_target_device = data.get(f"{prefix}target_device")
+            if serialized_target_device is None:
+                data[f"{prefix}target_device"] = cls.default_target_device
+            else:
+                target_device = normalize_target_device(serialized_target_device)
+                data[f"{prefix}target_device"] = (
+                    target_device
+                    if target_device in cls.supported_target_devices
+                    else cls.default_target_device
+                )
         if f"{p}target_cores" in data.keys() and f"{p}target_clusters" in data.keys():
             logger.warning(f"{p}target_cores and {p}target_clusters are both set!")
             logger.warning(
@@ -513,7 +539,18 @@ class MobilintAriesBackend(MobilintNPUBackend):
         elif self.core_mode == "global4":
             mc.set_global4_core_mode(self.target_clusters)
         elif self.core_mode == "global8":
-            assert len(self.target_clusters) == 2, "global8 must contain every cores!"
+            clusters = self.target_clusters
+            expected_clusters = {
+                _enum_value(Cluster.Cluster0),
+                _enum_value(Cluster.Cluster1),
+            }
+            if (
+                len(clusters) != len(expected_clusters)
+                or {_enum_value(cluster) for cluster in clusters} != expected_clusters
+            ):
+                raise ValueError(
+                    "global8 requires target_clusters to select both Aries clusters."
+                )
             mc.set_global8_core_mode()
         else:  # unreachable: __init__ validates against supported_core_modes
             raise ValueError(f"unhandled core_mode {self.core_mode!r}")

@@ -16,6 +16,9 @@ pytest options. Vision and Model Zoo own their own model APIs and CLI behavior.
 Before editing, run `git status --short`; read `pyproject.toml`, package exports,
 the affected backend, and focused tests. Preserve unrelated changes.
 
+The package supports Python 3.10 through 3.12. Keep package metadata and classifiers
+aligned with that floor before using newer language syntax or standard-library APIs.
+
 ## Runtime Contracts
 
 - Keep `MobilintNPUBackend` as the MXQ compatibility surface. Preserve `create`,

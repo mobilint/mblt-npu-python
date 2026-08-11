@@ -10,6 +10,7 @@ description: >-
 
 1. Read `AGENTS.md`, run `git status --short`, and inspect `pyproject.toml`, public exports,
    the affected backend, and focused tests before editing.
+   Keep the Python 3.10 minimum and supported-version classifiers aligned with language syntax.
 2. Preserve the `MobilintNPUBackend` compatibility contract: lifecycle methods, callable MXQ
    inference, input dtype inspection, serialization, and board-selected subclasses.
 3. Normalize legacy `aries`/`regulus` target values to board identifiers. Keep accepted boards and
