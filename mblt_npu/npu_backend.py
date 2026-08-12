@@ -29,6 +29,7 @@ core_map = {
     _enum_value(core): core for core in (Core.Core0, Core.Core1, Core.Core2, Core.Core3)
 }
 
+
 DEFAULT_TARGET_DEVICE = "aries-rb"
 """Default supported Mobilint NPU board."""
 
