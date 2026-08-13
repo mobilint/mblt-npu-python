@@ -20,7 +20,7 @@ description: >-
 5. Keep `ONNXBackend` optional and lazy. It must work with injected ONNX Runtime doubles in unit
    tests and raise the documented extra-installation error only when a real session is requested.
 6. Export public backends from `mblt_npu`, update optional extras with runtime changes, and avoid
-   making hardware, downloads, or ONNX Runtime mandatory for normal tests.
+   making hardware, native bindings, downloads, or ONNX Runtime mandatory for normal tests.
 7. For significant changes to APIs, backends, targets, dependencies, or artifact behavior, update
    `AGENTS.md`, this skill, the Claude entry point when its workflow changes, and the README in the
    same change. Run focused tests, Ruff, and `git diff --check`.
