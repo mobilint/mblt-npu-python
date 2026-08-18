@@ -1,5 +1,15 @@
 # Mobilint NPU Python
 
+<!-- markdownlint-disable MD033 -->
+<div align="center">
+<p>
+<a href="https://www.mobilint.com/" target="_blank">
+<img src="https://raw.githubusercontent.com/mobilint/.github/main/assets/Mobilint_Logo_Primary.png" alt="Mobilint Logo" width="60%">
+</a>
+</p>
+</div>
+<!-- markdownlint-enable MD033 -->
+
 Shared runtime support for applications that run MXQ models on Mobilint NPUs or ONNX models through ONNX Runtime.
 `mblt-npu-python` provides the common backend, device-selection rules, Hugging Face
 artifact resolution, and model-detail logging used by Mobilint Python packages. It
@@ -12,6 +22,10 @@ dependent — `npu_backend` imports `log_model_details`, and `log_model_details`
 a `MobilintNPUBackend`'s fields.
 
 ## Installation
+
+[![PyPI - Version](https://img.shields.io/pypi/v/mblt-npu-python?logo=pypi&logoColor=white)](https://pypi.org/project/mblt-npu-python/)
+[![PyPI Downloads](https://static.pepy.tech/badge/mblt-npu-python?period=total&units=INTERNATIONAL_SYSTEM&left_color=BLACK&right_color=GREEN&left_text=downloads)](https://clickpy.clickhouse.com/dashboard/mblt-npu-python)
+[![PyPI - Python Version](https://img.shields.io/pypi/pyversions/mblt-npu-python?logo=python&logoColor=gold)](https://pypi.org/project/mblt-npu-python/)
 
 ```bash
 pip install mblt-npu-python
