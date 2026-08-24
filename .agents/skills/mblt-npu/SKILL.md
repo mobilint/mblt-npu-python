@@ -13,6 +13,8 @@ description: >-
    Keep the Python 3.10 minimum and supported-version classifiers aligned with language syntax.
 2. Preserve the `MobilintNPUBackend` compatibility contract: lifecycle methods, callable MXQ
    inference, input dtype inspection, serialization, and board-selected subclasses.
+   For multi-slot backends, `max_batch_size` is aggregate capacity; keep slot-zero handles writable,
+   preserve `infer_slot()`, and roll back every slot after allocation or launch failure.
 3. Normalize legacy `aries`/`regulus` target values to board identifiers. Keep accepted boards and
    core modes explicit; reject unsupported combinations before calling qbruntime.
 4. Keep Vision-specific artifact folder policy out of this package. This package resolves an MXQ

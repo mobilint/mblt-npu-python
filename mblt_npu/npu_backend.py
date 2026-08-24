@@ -94,6 +94,17 @@ def _is_qbruntime_bad_alloc(exc: BaseException) -> bool:
     return "badalloc" in message.lower().replace(" ", "")
 
 
+def _make_core_id(cluster: "Cluster", core: "Core") -> "CoreId":
+    """Create ``CoreId`` across qbruntime constructor variants."""
+    try:
+        return CoreId(cluster, core)
+    except TypeError:
+        result = CoreId()
+        result.cluster = cluster
+        result.core = core
+        return result
+
+
 class MobilintBackendAllocError(RuntimeError):
     """Raised when a multi-slot backend fails to create or launch a slot.
 
@@ -180,17 +191,28 @@ class MobilintNPUBackend:
     num_of_clusters = 2
     num_of_cores_in_cluster = 4
 
+    default_target_device = DEFAULT_TARGET_DEVICE
+
+    def __new__(cls, *args: Any, **kwargs: Any):
+        """Select a board-specific backend while retaining the legacy constructor."""
+        if cls is MobilintNPUBackend:
+            target_device = kwargs.get("target_device")
+            if target_device is None and len(args) > 7:
+                target_device = args[7]
+            cls = backend_class_for(target_device or DEFAULT_TARGET_DEVICE)
+        return super().__new__(cls)
+
     def __init__(
         self,
         mxq_path: str = "",
         dev_no: Optional[Union[int, List[int]]] = None,
-        max_batch_size: int = 1,
         core_mode: CoreMode = "single",
         target_cores: Optional[List[Union[str, "CoreId"]]] = None,
         target_clusters: Optional[List[Union[int, str, "Cluster"]]] = None,
         revision: Optional[str] = None,
         commit_hash: Optional[str] = None,
         target_device: Optional[str] = None,
+        max_batch_size: int = 1,
         **kwargs,
     ):
         """Initializes the NPU backend configuration.
@@ -230,14 +252,10 @@ class MobilintNPUBackend:
             **kwargs: Additional keyword arguments (ignored; kept for
                 forward-compatibility).
         """
-        self.name_or_path: str = ""  # will be populated in MobilintModelMixin
+        self.name_or_path: str = kwargs.get("name_or_path", "")
         self.target_device = normalize_target_device(
-            target_device or DEFAULT_TARGET_DEVICE
+            target_device or self.default_target_device
         )
-        if self.target_device.startswith("regulus") and core_mode != "single":
-            raise ValueError(
-                f"core_mode {core_mode!r} is not available on {self.target_device}; only 'single' is supported."
-            )
         self.revision = revision
         self._commit_hash = commit_hash
         self.mxq_path = mxq_path
@@ -408,6 +426,7 @@ class MobilintNPUBackend:
                     return hf_hub_download(
                         repo_id=name_or_path,
                         filename=mxq_path,
+                        revision=revision,
                     )
                 except EntryNotFoundError:
                     mxq_revision = self._infer_revision_from_mxq_path(mxq_path)
@@ -421,7 +440,9 @@ class MobilintNPUBackend:
                         except EntryNotFoundError:
                             pass
 
-                    cached = self._find_cached_mxq(name_or_path, mxq_path)
+                    cached = self._find_cached_mxq(
+                        name_or_path, mxq_path, revision=revision
+                    )
                     if cached is not None:
                         return cached
                     mxq_candidate = self._find_mxq_from_hub(
@@ -515,7 +536,9 @@ class MobilintNPUBackend:
         return None
 
     @staticmethod
-    def _find_cached_mxq(repo_id: str, mxq_path: str) -> Optional[str]:
+    def _find_cached_mxq(
+        repo_id: str, mxq_path: str, revision: Optional[str] = None
+    ) -> Optional[str]:
         """Searches the local HF hub cache for a cached MXQ file.
 
         Checks each snapshot directory for the given repo, looking first for
@@ -553,6 +576,8 @@ class MobilintNPUBackend:
         rel_candidates = [mxq_path, os.path.basename(mxq_path)]
         try:
             for snapshot in os.listdir(snapshots_dir):
+                if revision is not None and snapshot != revision:
+                    continue
                 snapshot_dir = os.path.join(snapshots_dir, snapshot)
                 if not os.path.isdir(snapshot_dir):
                     continue
@@ -562,12 +587,6 @@ class MobilintNPUBackend:
                         return candidate
         except OSError:
             return None
-
-        # Last resort: find any mxq in snapshots
-        for root, _, files in os.walk(snapshots_dir):
-            for name in files:
-                if name.endswith(".mxq"):
-                    return os.path.join(root, name)
 
         return None
 
@@ -603,12 +622,34 @@ class MobilintNPUBackend:
         """
         return self.mxq_models[0] if self.mxq_models else None
 
+    @mxq_model.setter
+    def mxq_model(self, value: Optional["Model"]) -> None:
+        """Map the legacy writable slot-zero handle into ``mxq_models``."""
+        if value is None:
+            self.mxq_models = []
+            self.model_dev_no = []
+            self.n_models = 0
+        elif self.mxq_models:
+            self.mxq_models[0] = value
+        else:
+            self.mxq_models = [value]
+            self.model_dev_no = [self._fallback_dev()]
+            self.n_models = 1
+
     @property
     def acc(self) -> Optional["Accelerator"]:
         """First-inserted accelerator handle, or ``None`` before create()."""
         if not self.accs:
             return None
         return next(iter(self.accs.values()))
+
+    @acc.setter
+    def acc(self, value: Optional["Accelerator"]) -> None:
+        """Map the legacy writable accelerator handle into ``accs``."""
+        if value is None:
+            self.accs = {}
+        else:
+            self.accs[self._fallback_dev()] = value
 
     # ---- Target helpers ------------------------------------------------------
 
@@ -702,7 +743,7 @@ class MobilintNPUBackend:
             if d_val != int(dev):
                 continue
             try:
-                result.append(CoreId(cluster_map[c_val], core_map[k_val]))
+                result.append(_make_core_id(cluster_map[c_val], core_map[k_val]))
             except KeyError:
                 # Defensive: :func:`_migrate_target_cores` now rejects
                 # out-of-range cluster / core indices at construction time,
@@ -750,7 +791,9 @@ class MobilintNPUBackend:
                 not carry both clusters.
         """
         mc = ModelConfig()
-        if self.core_mode == "single":
+        if self.core_mode == "auto":
+            mc.set_auto_core_mode()
+        elif self.core_mode == "single":
             mc.set_single_core_mode(None, self.filter_cores_for(dev))
         elif self.core_mode == "multi":
             mc.set_multi_core_mode(self.filter_clusters_for(dev))
@@ -763,10 +806,7 @@ class MobilintNPUBackend:
             ), f"core_mode='global8' requires both clusters on device {dev}; got {len(clusters)}."
             mc.set_global8_core_mode()
         else:
-            raise ValueError(
-                "core_mode must be single, multi, global4 or global8! value: "
-                + str(self.core_mode)
-            )
+            raise ValueError(f"Unsupported core_mode {self.core_mode!r}.")
         return mc
 
     @staticmethod
@@ -999,6 +1039,11 @@ class MobilintNPUBackend:
             QbRuntimeError: If any slot fails to launch for a non-alloc
                 reason (after partial-state rollback).
         """
+        if not self.mxq_models:
+            raise RuntimeError(
+                "MobilintNPUBackend.launch() requires create() to succeed first."
+            )
+
         for i, m in enumerate(self.mxq_models):
             d = self.model_dev_no[i]
             try:
@@ -1192,7 +1237,7 @@ class MobilintNPUBackend:
         """
         result: List["CoreId"] = []
         for _dev, _cluster_idx, core_enum, cluster_enum in self._iter_core_entries():
-            result.append(CoreId(cluster_enum, core_enum))
+            result.append(_make_core_id(cluster_enum, core_enum))
         if result:
             return result
 
@@ -1201,7 +1246,7 @@ class MobilintNPUBackend:
         # target_cores empty.
         for _dev, cluster_enum in self._iter_cluster_entries():
             for core_enum in (Core.Core0, Core.Core1, Core.Core2, Core.Core3):
-                result.append(CoreId(cluster_enum, core_enum))
+                result.append(_make_core_id(cluster_enum, core_enum))
         return result
 
     @target_cores.setter
@@ -1254,14 +1299,14 @@ class MobilintNPUBackend:
         """
         result: Dict[int, List["CoreId"]] = {}
         for dev, _cluster_idx, core_enum, cluster_enum in self._iter_core_entries():
-            result.setdefault(dev, []).append(CoreId(cluster_enum, core_enum))
+            result.setdefault(dev, []).append(_make_core_id(cluster_enum, core_enum))
         if result:
             return result
 
         for dev, cluster_enum in self._iter_cluster_entries():
             bucket = result.setdefault(dev, [])
             for core_enum in (Core.Core0, Core.Core1, Core.Core2, Core.Core3):
-                bucket.append(CoreId(cluster_enum, core_enum))
+                bucket.append(_make_core_id(cluster_enum, core_enum))
         return result
 
     @property
@@ -1321,11 +1366,14 @@ class MobilintNPUBackend:
         """
         p = prefix
         result: Dict[str, Any] = {
+            "name_or_path": self.name_or_path,
             f"{p}mxq_path": self.mxq_path,
             f"{p}dev_no": self._spec.dev_no_for_serialization(),
             f"{p}max_batch_size": self.max_batch_size,
             f"{p}core_mode": self.core_mode,
             f"{p}target_device": self.target_device,
+            f"{p}revision": self.revision,
+            f"{p}commit_hash": self._commit_hash,
         }
 
         if self.core_mode == "single":
@@ -1357,6 +1405,7 @@ class MobilintNPUBackend:
             A new :class:`MobilintNPUBackend` instance configured from
             ``data``.
         """
+        data = dict(data)
         p = prefix
         if f"{p}target_cores" in data.keys() and f"{p}target_clusters" in data.keys():
             logger.warning("%starget_cores and %starget_clusters are both set!", p, p)
@@ -1387,11 +1436,54 @@ class MobilintNPUBackend:
         )
 
 
-# Compatibility names retained while product-specific core validation moves to
-# the runtime package. Multi-slot topology is board-agnostic; callers should
-# use ``target_device`` on ``MobilintNPUBackend``.
-MobilintAriesBackend = MobilintNPUBackend
-MobilintRegulusBackend = MobilintNPUBackend
+class MobilintAriesBackend(MobilintNPUBackend):
+    """Aries backend: supports all core modes and the two-cluster topology."""
+
+    default_target_device = "aries-rb"
+
+    def _configure_core_mode(self, mc: "ModelConfig") -> None:
+        """Compatibility helper used by integrations that configure a raw ModelConfig."""
+        if self.core_mode == "global8" and len(self.target_clusters) != 2:
+            raise ValueError(
+                "global8 requires target_clusters to select both Aries clusters."
+            )
+        self._make_slot_config(self._fallback_dev())
+
+
+class MobilintRegulusBackend(MobilintNPUBackend):
+    """Regulus backend: validates its one-core, single/auto-only topology."""
+
+    default_target_device = "regulus-ra"
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        core_mode = kwargs.get("core_mode", args[2] if len(args) > 2 else "single")
+        if core_mode not in {"auto", "single"}:
+            raise ValueError("Regulus supports only 'auto' and 'single' core modes.")
+        if len(args) > 3 and args[3] is None:
+            args = (*args[:3], ["0:0:0"], *args[4:])
+        elif (
+            kwargs.get("target_cores") is None and kwargs.get("target_clusters") is None
+        ):
+            kwargs["target_cores"] = ["0:0:0"]
+        super().__init__(*args, **kwargs)
+        if self.target_clusters:
+            raise ValueError(
+                "target_clusters is meaningless on regulus; use its sole core (0:0)."
+            )
+        if tuple(self._spec.cores) != ("0:0:0",):
+            raise ValueError(
+                "target_cores on regulus may select only its sole core (0:0)."
+            )
+
+    def _make_slot_config(self, dev: int) -> "ModelConfig":
+        mc = ModelConfig()
+        if self.core_mode == "auto":
+            mc.set_auto_core_mode()
+        else:
+            mc.set_single_core_mode(None, self.filter_cores_for(dev))
+        return mc
+
+
 BACKEND_CLASSES = {
     "aries-rb": MobilintAriesBackend,
     "regulus-ra": MobilintRegulusBackend,
@@ -1400,5 +1492,5 @@ BACKEND_CLASSES = {
 
 
 def backend_class_for(target_device: str):
-    """Return the compatible backend class for a normalized board identifier."""
+    """Return the backend implementation for a normalized board identifier."""
     return BACKEND_CLASSES[normalize_target_device(target_device)]

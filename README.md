@@ -62,6 +62,20 @@ remain accepted when loading older configurations.
 `backend_class_for()` and `BACKEND_CLASSES` are available for integrations that
 need to inspect the supported targets.
 
+### Multi-slot MXQ execution
+
+`max_batch_size` is aggregate capacity. At `create()`, the backend probes the
+compiled per-model capacity `K` and loads `ceil(max_batch_size / K)` model slots.
+Slots are distributed round-robin over the devices named by canonical target
+strings and reuse one accelerator per device. `mxq_model` and `acc` continue to
+refer to slot zero for compatibility; concurrent callers can use
+`infer_slot(slot_index, inputs)`. Allocation failures dispose all created slots
+and raise `MobilintBackendAllocError` with the failed slot and device.
+
+Hub-backed configurations retain `name_or_path`, `revision`, and `commit_hash`
+through `to_dict()` / `from_dict()`. Artifact lookup never substitutes an
+unpinned revision or an unrelated cached MXQ.
+
 For ONNX inference, install the optional runtime extra and use `ONNXBackend`:
 
 ```bash
