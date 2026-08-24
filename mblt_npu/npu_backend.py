@@ -1470,7 +1470,7 @@ class MobilintAriesBackend(MobilintNPUBackend):
             raise ValueError(
                 "global8 requires target_clusters to select both Aries clusters."
             )
-        dev = self._fallback_dev()
+        dev = self._unique_devs_from_targets()[0]
         if self.core_mode == "auto":
             mc.set_auto_core_mode()
         elif self.core_mode == "single":
@@ -1493,12 +1493,21 @@ class MobilintRegulusBackend(MobilintNPUBackend):
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         core_mode = kwargs.get("core_mode", args[2] if len(args) > 2 else "single")
-        has_explicit_targets = (
-            kwargs.get("target_cores") is not None
-            or kwargs.get("target_clusters") is not None
-            or (len(args) > 3 and args[3] is not None)
-            or (len(args) > 4 and args[4] is not None)
+        raw_target_cores = kwargs.get(
+            "target_cores", args[3] if len(args) > 3 else None
         )
+        raw_target_clusters = kwargs.get(
+            "target_clusters", args[4] if len(args) > 4 else None
+        )
+        has_explicit_targets = bool(raw_target_cores) or bool(raw_target_clusters)
+        if core_mode == "auto" and raw_target_cores:
+            for target in raw_target_cores:
+                if isinstance(target, str):
+                    parts = target.split(":")
+                    if len(parts) not in {2, 3} or parts[-2:] != ["0", "0"]:
+                        raise ValueError(
+                            "Regulus auto mode accepts only its sole core (0:0)."
+                        )
         if core_mode not in {"auto", "single"}:
             raise ValueError("Regulus supports only 'auto' and 'single' core modes.")
         dev_no = kwargs.get("dev_no", args[1] if len(args) > 1 else 0)
@@ -1529,8 +1538,8 @@ class MobilintRegulusBackend(MobilintNPUBackend):
             raise ValueError(
                 "target_clusters is meaningless on regulus; use its sole core (0:0)."
             )
-        expected_cores = tuple(f"{dev}:0:0" for dev in self._spec.unique_devices())
-        if tuple(self._spec.cores) != expected_cores:
+        expected_cores = {f"{dev}:0:0" for dev in self._spec.unique_devices()}
+        if set(self._spec.cores) != expected_cores:
             raise ValueError(
                 "target_cores on regulus may select only its sole core (0:0)."
             )

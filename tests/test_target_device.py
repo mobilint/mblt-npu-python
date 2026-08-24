@@ -337,3 +337,20 @@ def test_regulus_repeated_devices_are_deduplicated() -> None:
     backend = MobilintNPUBackend(target_device="regulus-ra", dev_no=[1, 1])
 
     assert backend.to_dict()["target_cores"] == ["1:0:0"]
+
+
+def test_regulus_auto_mode_rejects_nonzero_explicit_core() -> None:
+    with pytest.raises(ValueError, match="sole core"):
+        MobilintRegulusBackend(core_mode="auto", target_cores=["0:0:3"])
+
+
+def test_regulus_default_validation_ignores_device_order_and_duplicates() -> None:
+    backend = MobilintNPUBackend(target_device="regulus-ra", dev_no=[1, 0, 1])
+
+    assert set(backend.to_dict()["target_cores"]) == {"0:0:0", "1:0:0"}
+
+
+def test_regulus_auto_empty_targets_are_treated_as_target_free() -> None:
+    backend = MobilintRegulusBackend(core_mode="auto", target_clusters=[])
+
+    assert backend.core_mode == "auto"
