@@ -51,7 +51,9 @@ from .npu_target import (
     NPUTargetSpec,
     NPUTargetSpecPending,
     cluster_map,
+    cluster_to_int,
     core_map,
+    core_to_int,
 )
 
 logger = logging.getLogger(__name__)
@@ -1508,6 +1510,12 @@ class MobilintRegulusBackend(MobilintNPUBackend):
                         raise ValueError(
                             "Regulus auto mode accepts only its sole core (0:0)."
                         )
+                elif isinstance(target, CoreId) and (
+                    cluster_to_int(target.cluster) != 0 or core_to_int(target.core) != 0
+                ):
+                    raise ValueError(
+                        "Regulus auto mode accepts only its sole core (0:0)."
+                    )
         if core_mode not in {"auto", "single"}:
             raise ValueError("Regulus supports only 'auto' and 'single' core modes.")
         dev_no = kwargs.get("dev_no", args[1] if len(args) > 1 else 0)
@@ -1517,6 +1525,7 @@ class MobilintRegulusBackend(MobilintNPUBackend):
             else [0 if dev_no is None else dev_no]
         )
         default_cores = [f"{int(dev)}:0:0" for dev in devs]
+        default_clusters = [f"{int(dev)}:0" for dev in devs]
         if core_mode == "single" and len(args) > 3 and args[3] is None:
             args = (*args[:3], default_cores, *args[4:])
         elif (
@@ -1525,6 +1534,14 @@ class MobilintRegulusBackend(MobilintNPUBackend):
             and kwargs.get("target_clusters") is None
         ):
             kwargs["target_cores"] = default_cores
+        elif core_mode == "auto" and not has_explicit_targets:
+            # The generic auto-mode defaults describe Aries' two clusters.
+            # Preserve target-free intent while serializing Regulus' sole
+            # cluster so a round trip stays on the Regulus topology.
+            if len(args) > 4 and args[4] is None:
+                args = (*args[:4], default_clusters, *args[5:])
+            else:
+                kwargs["target_clusters"] = default_clusters
         super().__init__(*args, **kwargs)
         if self.core_mode == "auto":
             if has_explicit_targets and any(

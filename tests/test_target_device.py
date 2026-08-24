@@ -344,6 +344,18 @@ def test_regulus_auto_mode_rejects_nonzero_explicit_core() -> None:
         MobilintRegulusBackend(core_mode="auto", target_cores=["0:0:3"])
 
 
+def test_regulus_auto_mode_rejects_nonzero_core_id_before_normalization() -> None:
+    with pytest.raises(ValueError, match="sole core"):
+        MobilintRegulusBackend(
+            core_mode="auto",
+            target_cores=[
+                npu_backend._make_core_id(
+                    npu_backend.Cluster.Cluster0, npu_backend.Core.Core3
+                )
+            ],
+        )
+
+
 def test_regulus_default_validation_ignores_device_order_and_duplicates() -> None:
     backend = MobilintNPUBackend(target_device="regulus-ra", dev_no=[1, 0, 1])
 
@@ -354,3 +366,7 @@ def test_regulus_auto_empty_targets_are_treated_as_target_free() -> None:
     backend = MobilintRegulusBackend(core_mode="auto", target_clusters=[])
 
     assert backend.core_mode == "auto"
+    assert backend.to_dict()["target_clusters"] == ["0:0"]
+    restored = MobilintNPUBackend.from_dict(backend.to_dict())
+    assert isinstance(restored, MobilintRegulusBackend)
+    assert restored.to_dict()["target_clusters"] == ["0:0"]
