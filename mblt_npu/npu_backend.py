@@ -192,6 +192,7 @@ class MobilintNPUBackend:
     num_of_cores_in_cluster = 4
 
     default_target_device = DEFAULT_TARGET_DEVICE
+    supported_target_devices = ("aries-rb", "regulus-ra", "regulus-rb")
 
     def __new__(cls, *args: Any, **kwargs: Any):
         """Select a board-specific backend while retaining the legacy constructor."""
@@ -256,6 +257,10 @@ class MobilintNPUBackend:
         self.target_device = normalize_target_device(
             target_device or self.default_target_device
         )
+        if self.target_device not in self.supported_target_devices:
+            raise ValueError(
+                f"target_device {self.target_device!r} is not supported by {type(self).__name__}."
+            )
         self.revision = revision
         self._commit_hash = commit_hash
         self.mxq_path = mxq_path
@@ -429,8 +434,12 @@ class MobilintNPUBackend:
                         revision=revision,
                     )
                 except EntryNotFoundError:
-                    mxq_revision = self._infer_revision_from_mxq_path(mxq_path)
-                    if mxq_revision and mxq_revision != revision:
+                    mxq_revision = (
+                        None
+                        if revision is not None
+                        else self._infer_revision_from_mxq_path(mxq_path)
+                    )
+                    if mxq_revision is not None:
                         try:
                             return hf_hub_download(
                                 repo_id=name_or_path,
@@ -440,22 +449,23 @@ class MobilintNPUBackend:
                         except EntryNotFoundError:
                             pass
 
+                    fallback_revision = revision or mxq_revision
                     cached = self._find_cached_mxq(
-                        name_or_path, mxq_path, revision=revision
+                        name_or_path, mxq_path, revision=fallback_revision
                     )
                     if cached is not None:
                         return cached
                     mxq_candidate = self._find_mxq_from_hub(
                         name_or_path,
                         mxq_path,
-                        revision=mxq_revision or revision,
+                        revision=fallback_revision,
                     )
                     if mxq_candidate is None:
                         raise
                     return hf_hub_download(
                         repo_id=name_or_path,
                         filename=mxq_candidate,
-                        revision=mxq_revision or revision,
+                        revision=fallback_revision,
                     )
 
         raise Exception(f"[Mobilint] Error: Could not locate {mxq_path}.")
@@ -575,8 +585,16 @@ class MobilintNPUBackend:
 
         rel_candidates = [mxq_path, os.path.basename(mxq_path)]
         try:
+            resolved_revision = revision
+            if revision is not None:
+                ref_path = os.path.join(repo_dir, "refs", revision)
+                try:
+                    with open(ref_path, "r", encoding="utf-8") as ref_file:
+                        resolved_revision = ref_file.read().strip() or revision
+                except OSError:
+                    pass
             for snapshot in os.listdir(snapshots_dir):
-                if revision is not None and snapshot != revision:
+                if resolved_revision is not None and snapshot != resolved_revision:
                     continue
                 snapshot_dir = os.path.join(snapshots_dir, snapshot)
                 if not os.path.isdir(snapshot_dir):
@@ -626,9 +644,11 @@ class MobilintNPUBackend:
     def mxq_model(self, value: Optional["Model"]) -> None:
         """Map the legacy writable slot-zero handle into ``mxq_models``."""
         if value is None:
+            self._dispose_all_slots()
             self.mxq_models = []
             self.model_dev_no = []
             self.n_models = 0
+            self.accs = {}
         elif self.mxq_models:
             self.mxq_models[0] = value
         else:
@@ -1366,7 +1386,7 @@ class MobilintNPUBackend:
         """
         p = prefix
         result: Dict[str, Any] = {
-            "name_or_path": self.name_or_path,
+            f"{p}name_or_path": self.name_or_path,
             f"{p}mxq_path": self.mxq_path,
             f"{p}dev_no": self._spec.dev_no_for_serialization(),
             f"{p}max_batch_size": self.max_batch_size,
@@ -1419,7 +1439,9 @@ class MobilintNPUBackend:
             )
 
         return cls(
-            name_or_path=data.pop("name_or_path", ""),
+            name_or_path=data.pop(f"{p}name_or_path", "")
+            if p
+            else data.pop("name_or_path", ""),
             mxq_path=data.pop(f"{p}mxq_path", ""),
             # ``None`` sentinel: distinguish "caller did not provide
             # dev_no" from "caller explicitly requested dev_no=0" so
@@ -1440,6 +1462,7 @@ class MobilintAriesBackend(MobilintNPUBackend):
     """Aries backend: supports all core modes and the two-cluster topology."""
 
     default_target_device = "aries-rb"
+    supported_target_devices = ("aries-rb",)
 
     def _configure_core_mode(self, mc: "ModelConfig") -> None:
         """Compatibility helper used by integrations that configure a raw ModelConfig."""
@@ -1447,30 +1470,54 @@ class MobilintAriesBackend(MobilintNPUBackend):
             raise ValueError(
                 "global8 requires target_clusters to select both Aries clusters."
             )
-        self._make_slot_config(self._fallback_dev())
+        if self.core_mode == "auto":
+            mc.set_auto_core_mode()
+        elif self.core_mode == "single":
+            mc.set_single_core_mode(None, self.target_cores)
+        elif self.core_mode == "multi":
+            mc.set_multi_core_mode(self.target_clusters)
+        elif self.core_mode == "global4":
+            mc.set_global4_core_mode(self.target_clusters)
+        else:
+            mc.set_global8_core_mode()
 
 
 class MobilintRegulusBackend(MobilintNPUBackend):
     """Regulus backend: validates its one-core, single/auto-only topology."""
 
     default_target_device = "regulus-ra"
+    supported_target_devices = ("regulus-ra", "regulus-rb")
+    num_of_clusters = 1
+    num_of_cores_in_cluster = 1
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         core_mode = kwargs.get("core_mode", args[2] if len(args) > 2 else "single")
         if core_mode not in {"auto", "single"}:
             raise ValueError("Regulus supports only 'auto' and 'single' core modes.")
-        if len(args) > 3 and args[3] is None:
-            args = (*args[:3], ["0:0:0"], *args[4:])
+        dev_no = kwargs.get("dev_no", args[1] if len(args) > 1 else 0)
+        devs = (
+            list(dev_no)
+            if isinstance(dev_no, (list, tuple))
+            else [0 if dev_no is None else dev_no]
+        )
+        default_cores = [f"{int(dev)}:0:0" for dev in devs]
+        if core_mode == "single" and len(args) > 3 and args[3] is None:
+            args = (*args[:3], default_cores, *args[4:])
         elif (
-            kwargs.get("target_cores") is None and kwargs.get("target_clusters") is None
+            core_mode == "single"
+            and kwargs.get("target_cores") is None
+            and kwargs.get("target_clusters") is None
         ):
-            kwargs["target_cores"] = ["0:0:0"]
+            kwargs["target_cores"] = default_cores
         super().__init__(*args, **kwargs)
+        if self.core_mode == "auto":
+            return
         if self.target_clusters:
             raise ValueError(
                 "target_clusters is meaningless on regulus; use its sole core (0:0)."
             )
-        if tuple(self._spec.cores) != ("0:0:0",):
+        expected_cores = tuple(default_cores)
+        if tuple(self._spec.cores) != expected_cores:
             raise ValueError(
                 "target_cores on regulus may select only its sole core (0:0)."
             )
@@ -1479,8 +1526,10 @@ class MobilintRegulusBackend(MobilintNPUBackend):
         mc = ModelConfig()
         if self.core_mode == "auto":
             mc.set_auto_core_mode()
-        else:
+        elif self.core_mode == "single":
             mc.set_single_core_mode(None, self.filter_cores_for(dev))
+        else:
+            raise ValueError("Regulus supports only 'auto' and 'single' core modes.")
         return mc
 
 

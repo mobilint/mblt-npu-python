@@ -86,10 +86,17 @@ _NATIVE_CORE_TO_INDEX = {_enum_value(value): index for index, value in core_map.
 
 
 def _cluster_index(value: int) -> int:
+    # Canonical ordinal values are the public wire format. Native enum values
+    # overlap (e.g. Core1's native value may be 1), so never translate an
+    # already-valid ordinal.
+    if value in _VALID_CLUSTER_INDICES:
+        return value
     return _NATIVE_CLUSTER_TO_INDEX.get(value, value)
 
 
 def _core_index(value: int) -> int:
+    if value in _VALID_CORE_INDICES:
+        return value
     return _NATIVE_CORE_TO_INDEX.get(value, value)
 
 

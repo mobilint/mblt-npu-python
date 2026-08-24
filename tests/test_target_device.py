@@ -278,3 +278,43 @@ def test_backend_exposes_vision_runtime_compatibility_methods() -> None:
 
     assert backend("input") == ("output", "input")
     assert backend.get_dtype() == "DataType.Uint8"
+
+
+def test_ordinal_core_ids_are_not_reinterpreted_as_native_values() -> None:
+    backend = MobilintNPUBackend(target_cores=["0:0:1", "0:0:2", "0:0:3"])
+
+    assert backend.to_dict()["target_cores"] == ["0:0:1", "0:0:2", "0:0:3"]
+
+
+def test_cached_named_revision_resolves_its_ref(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    cache_root = tmp_path / "hub"
+    repo_dir = cache_root / "models--mobilint--example"
+    cached = repo_dir / "snapshots" / "abc123" / "model.mxq"
+    cached.parent.mkdir(parents=True)
+    cached.touch()
+    (repo_dir / "refs").mkdir()
+    (repo_dir / "refs" / "release-1").write_text("abc123", encoding="utf-8")
+    monkeypatch.setenv("HUGGINGFACE_HUB_CACHE", str(cache_root))
+
+    assert MobilintNPUBackend._find_cached_mxq(
+        "mobilint/example", "model.mxq", "release-1"
+    ) == str(cached)
+
+
+def test_prefixed_round_trip_keeps_each_hub_repository() -> None:
+    first = MobilintNPUBackend(name_or_path="first", mxq_path="model.mxq")
+    second = MobilintNPUBackend(name_or_path="second", mxq_path="model.mxq")
+    data = {**first.to_dict("first_"), **second.to_dict("second_")}
+
+    assert MobilintNPUBackend.from_dict(data, "first_").name_or_path == "first"
+    assert MobilintNPUBackend.from_dict(data, "second_").name_or_path == "second"
+
+
+def test_regulus_auto_mode_and_nonzero_device_are_valid() -> None:
+    auto = MobilintNPUBackend(target_device="regulus-ra", core_mode="auto")
+    selected = MobilintNPUBackend(target_device="regulus-ra", dev_no=1)
+
+    assert auto.core_mode == "auto"
+    assert selected.to_dict()["target_cores"] == ["1:0:0"]
