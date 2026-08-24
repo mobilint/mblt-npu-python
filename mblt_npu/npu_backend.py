@@ -1439,7 +1439,7 @@ class MobilintNPUBackend:
             )
 
         return cls(
-            name_or_path=data.pop(f"{p}name_or_path", "")
+            name_or_path=data.pop(f"{p}name_or_path", data.get("name_or_path", ""))
             if p
             else data.pop("name_or_path", ""),
             mxq_path=data.pop(f"{p}mxq_path", ""),
@@ -1470,14 +1470,15 @@ class MobilintAriesBackend(MobilintNPUBackend):
             raise ValueError(
                 "global8 requires target_clusters to select both Aries clusters."
             )
+        dev = self._fallback_dev()
         if self.core_mode == "auto":
             mc.set_auto_core_mode()
         elif self.core_mode == "single":
-            mc.set_single_core_mode(None, self.target_cores)
+            mc.set_single_core_mode(None, self.filter_cores_for(dev))
         elif self.core_mode == "multi":
-            mc.set_multi_core_mode(self.target_clusters)
+            mc.set_multi_core_mode(self.filter_clusters_for(dev))
         elif self.core_mode == "global4":
-            mc.set_global4_core_mode(self.target_clusters)
+            mc.set_global4_core_mode(self.filter_clusters_for(dev))
         else:
             mc.set_global8_core_mode()
 
@@ -1492,6 +1493,12 @@ class MobilintRegulusBackend(MobilintNPUBackend):
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         core_mode = kwargs.get("core_mode", args[2] if len(args) > 2 else "single")
+        has_explicit_targets = (
+            kwargs.get("target_cores") is not None
+            or kwargs.get("target_clusters") is not None
+            or (len(args) > 3 and args[3] is not None)
+            or (len(args) > 4 and args[4] is not None)
+        )
         if core_mode not in {"auto", "single"}:
             raise ValueError("Regulus supports only 'auto' and 'single' core modes.")
         dev_no = kwargs.get("dev_no", args[1] if len(args) > 1 else 0)
@@ -1511,12 +1518,18 @@ class MobilintRegulusBackend(MobilintNPUBackend):
             kwargs["target_cores"] = default_cores
         super().__init__(*args, **kwargs)
         if self.core_mode == "auto":
+            if has_explicit_targets and any(
+                cluster.split(":", 1)[1] != "0" for cluster in self._spec.clusters
+            ):
+                raise ValueError(
+                    "Regulus auto mode accepts targets only for its sole core/cluster (0:0)."
+                )
             return
         if self.target_clusters:
             raise ValueError(
                 "target_clusters is meaningless on regulus; use its sole core (0:0)."
             )
-        expected_cores = tuple(default_cores)
+        expected_cores = tuple(f"{dev}:0:0" for dev in self._spec.unique_devices())
         if tuple(self._spec.cores) != expected_cores:
             raise ValueError(
                 "target_cores on regulus may select only its sole core (0:0)."

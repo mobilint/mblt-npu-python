@@ -318,3 +318,22 @@ def test_regulus_auto_mode_and_nonzero_device_are_valid() -> None:
 
     assert auto.core_mode == "auto"
     assert selected.to_dict()["target_cores"] == ["1:0:0"]
+
+
+def test_prefixed_deserialization_accepts_legacy_repository_identity() -> None:
+    backend = MobilintNPUBackend.from_dict(
+        {"name_or_path": "repo", "enc_mxq_path": "model.mxq"}, "enc_"
+    )
+
+    assert backend.name_or_path == "repo"
+
+
+def test_regulus_auto_mode_rejects_nonexistent_explicit_targets() -> None:
+    with pytest.raises(ValueError, match="sole core"):
+        MobilintRegulusBackend(core_mode="auto", target_clusters=["0:1"])
+
+
+def test_regulus_repeated_devices_are_deduplicated() -> None:
+    backend = MobilintNPUBackend(target_device="regulus-ra", dev_no=[1, 1])
+
+    assert backend.to_dict()["target_cores"] == ["1:0:0"]
