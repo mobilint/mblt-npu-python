@@ -1,5 +1,15 @@
 # Mobilint NPU Python
 
+<!-- markdownlint-disable MD033 -->
+<div align="center">
+<p>
+<a href="https://www.mobilint.com/" target="_blank">
+<img src="https://raw.githubusercontent.com/mobilint/.github/main/assets/Mobilint_Logo_Primary.png" alt="Mobilint Logo" width="60%">
+</a>
+</p>
+</div>
+<!-- markdownlint-enable MD033 -->
+
 Shared runtime support for applications that run MXQ models on Mobilint NPUs or ONNX models through ONNX Runtime.
 `mblt-npu-python` provides the common backend, device-selection rules, Hugging Face
 artifact resolution, and model-detail logging used by Mobilint Python packages. It
@@ -12,6 +22,10 @@ dependent — `npu_backend` imports `log_model_details`, and `log_model_details`
 a `MobilintNPUBackend`'s fields.
 
 ## Installation
+
+[![PyPI - Version](https://img.shields.io/pypi/v/mblt-npu-python?logo=pypi&logoColor=white)](https://pypi.org/project/mblt-npu-python/)
+[![PyPI Downloads](https://static.pepy.tech/badge/mblt-npu-python?period=total&units=INTERNATIONAL_SYSTEM&left_color=BLACK&right_color=GREEN&left_text=downloads)](https://clickpy.clickhouse.com/dashboard/mblt-npu-python)
+[![PyPI - Python Version](https://img.shields.io/pypi/pyversions/mblt-npu-python?logo=python&logoColor=gold)](https://pypi.org/project/mblt-npu-python/)
 
 ```bash
 pip install mblt-npu-python
@@ -47,6 +61,20 @@ finally:
 remain accepted when loading older configurations.
 `backend_class_for()` and `BACKEND_CLASSES` are available for integrations that
 need to inspect the supported targets.
+
+### Multi-slot MXQ execution
+
+`max_batch_size` is aggregate capacity. At `create()`, the backend probes the
+compiled per-model capacity `K` and loads `ceil(max_batch_size / K)` model slots.
+Slots are distributed round-robin over the devices named by canonical target
+strings and reuse one accelerator per device. `mxq_model` and `acc` continue to
+refer to slot zero for compatibility; concurrent callers can use
+`infer_slot(slot_index, inputs)`. Allocation failures dispose all created slots
+and raise `MobilintBackendAllocError` with the failed slot and device.
+
+Hub-backed configurations retain `name_or_path`, `revision`, and `commit_hash`
+through `to_dict()` / `from_dict()`. Artifact lookup never substitutes an
+unpinned revision or an unrelated cached MXQ.
 
 For ONNX inference, install the optional runtime extra and use `ONNXBackend`:
 

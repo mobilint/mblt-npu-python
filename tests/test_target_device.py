@@ -73,7 +73,7 @@ def test_regulus_accepts_its_sole_explicit_core() -> None:
 
     backend = MobilintRegulusBackend(target_cores=["0:0"])
 
-    assert backend.to_dict()["target_cores"] == ["0:0"]
+    assert backend.to_dict()["target_cores"] == ["0:0:0"]
 
 
 def test_from_dict_does_not_consume_callers_configuration() -> None:
@@ -119,10 +119,8 @@ def test_global8_requires_both_distinct_aries_clusters(
         def set_global8_core_mode(self) -> None:
             pytest.fail("global8 must not configure an invalid cluster selection")
 
-    backend = MobilintAriesBackend(core_mode="global8", target_clusters=target_clusters)
-
-    with pytest.raises(ValueError, match="both Aries clusters"):
-        backend._configure_core_mode(cast(Any, _ModelConfig()))
+    with pytest.raises(ValueError, match="both clusters"):
+        MobilintAriesBackend(core_mode="global8", target_clusters=target_clusters)
 
 
 @pytest.mark.parametrize(
@@ -152,9 +150,9 @@ def test_legacy_core_and_cluster_assignments_round_trip() -> None:
     cluster = MobilintNPUBackend(core_mode="global4", target_clusters=[0])
 
     assert len(single_core.target_cores) == 1
-    assert single_core.to_dict()["target_cores"] == ["0:0"]
+    assert single_core.to_dict()["target_cores"] == ["0:0:0"]
     assert len(cluster.target_clusters) == 1
-    assert cluster.to_dict()["target_clusters"] == [0]
+    assert cluster.to_dict()["target_clusters"] == ["0:0"]
 
 
 def test_target_cores_supports_no_argument_core_id_bindings(
@@ -280,3 +278,101 @@ def test_backend_exposes_vision_runtime_compatibility_methods() -> None:
 
     assert backend("input") == ("output", "input")
     assert backend.get_dtype() == "DataType.Uint8"
+
+
+def test_ordinal_core_ids_are_not_reinterpreted_as_native_values() -> None:
+    backend = MobilintNPUBackend(target_cores=["0:0:1", "0:0:2", "0:0:3"])
+
+    assert backend.to_dict()["target_cores"] == ["0:0:1", "0:0:2", "0:0:3"]
+
+
+def test_cached_named_revision_resolves_its_ref(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    cache_root = tmp_path / "hub"
+    repo_dir = cache_root / "models--mobilint--example"
+    cached = repo_dir / "snapshots" / "abc123" / "model.mxq"
+    cached.parent.mkdir(parents=True)
+    cached.touch()
+    (repo_dir / "refs").mkdir()
+    (repo_dir / "refs" / "release-1").write_text("abc123", encoding="utf-8")
+    monkeypatch.setenv("HUGGINGFACE_HUB_CACHE", str(cache_root))
+
+    assert MobilintNPUBackend._find_cached_mxq(
+        "mobilint/example", "model.mxq", "release-1"
+    ) == str(cached)
+
+
+def test_prefixed_round_trip_keeps_each_hub_repository() -> None:
+    first = MobilintNPUBackend(name_or_path="first", mxq_path="model.mxq")
+    second = MobilintNPUBackend(name_or_path="second", mxq_path="model.mxq")
+    data = {**first.to_dict("first_"), **second.to_dict("second_")}
+
+    assert MobilintNPUBackend.from_dict(data, "first_").name_or_path == "first"
+    assert MobilintNPUBackend.from_dict(data, "second_").name_or_path == "second"
+
+
+def test_regulus_auto_mode_and_nonzero_device_are_valid() -> None:
+    auto = MobilintNPUBackend(target_device="regulus-ra", core_mode="auto")
+    selected = MobilintNPUBackend(target_device="regulus-ra", dev_no=1)
+
+    assert auto.core_mode == "auto"
+    assert selected.to_dict()["target_cores"] == ["1:0:0"]
+
+
+def test_prefixed_deserialization_accepts_legacy_repository_identity() -> None:
+    backend = MobilintNPUBackend.from_dict(
+        {"name_or_path": "repo", "enc_mxq_path": "model.mxq"}, "enc_"
+    )
+
+    assert backend.name_or_path == "repo"
+
+
+def test_regulus_auto_mode_rejects_nonexistent_explicit_targets() -> None:
+    with pytest.raises(ValueError, match="sole core"):
+        MobilintRegulusBackend(core_mode="auto", target_clusters=["0:1"])
+
+
+def test_regulus_repeated_devices_are_deduplicated() -> None:
+    backend = MobilintNPUBackend(target_device="regulus-ra", dev_no=[1, 1])
+
+    assert backend.to_dict()["target_cores"] == ["1:0:0"]
+
+
+def test_regulus_auto_mode_rejects_nonzero_explicit_core() -> None:
+    with pytest.raises(ValueError, match="sole core"):
+        MobilintRegulusBackend(core_mode="auto", target_cores=["0:0:3"])
+
+
+def test_regulus_auto_mode_rejects_nonzero_core_id_before_normalization() -> None:
+    with pytest.raises(ValueError, match="sole core"):
+        MobilintRegulusBackend(
+            core_mode="auto",
+            target_cores=[
+                npu_backend._make_core_id(
+                    npu_backend.Cluster.Cluster0, npu_backend.Core.Core3
+                )
+            ],
+        )
+
+
+def test_regulus_default_validation_ignores_device_order_and_duplicates() -> None:
+    backend = MobilintNPUBackend(target_device="regulus-ra", dev_no=[1, 0, 1])
+
+    assert set(backend.to_dict()["target_cores"]) == {"0:0:0", "1:0:0"}
+
+
+def test_regulus_auto_empty_targets_are_treated_as_target_free() -> None:
+    backend = MobilintRegulusBackend(core_mode="auto", target_clusters=[])
+
+    assert backend.core_mode == "auto"
+    assert backend.to_dict()["target_clusters"] == ["0:0"]
+    restored = MobilintNPUBackend.from_dict(backend.to_dict())
+    assert isinstance(restored, MobilintRegulusBackend)
+    assert restored.to_dict()["target_clusters"] == ["0:0"]
+
+
+def test_regulus_auto_positional_empty_cluster_targets_are_canonicalized() -> None:
+    backend = MobilintRegulusBackend("", 0, "auto", None, [])
+
+    assert backend.to_dict()["target_clusters"] == ["0:0"]

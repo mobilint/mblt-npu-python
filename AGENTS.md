@@ -24,6 +24,10 @@ aligned with that floor before using newer language syntax or standard-library A
 - Keep `MobilintNPUBackend` as the MXQ compatibility surface. Preserve `create`,
   `launch`, callable inference, `get_dtype`, `dispose`, serialization, and board
   selection behavior.
+- `max_batch_size` is aggregate capacity: probe the compiled per-slot batch axis
+  `K`, launch `ceil(max_batch_size / K)` slots, share accelerators per device,
+  and preserve slot-zero compatibility handles. Keep allocation rollback and
+  `infer_slot()` deterministic across all slots.
 - Normalize legacy `aries` to `aries-rb` and `regulus` to `regulus-ra`. Supported
   board identifiers are `aries-rb`, `regulus-ra`, and `regulus-rb`.
 - Keep core-mode validation board-specific. Do not let an unsupported mode reach

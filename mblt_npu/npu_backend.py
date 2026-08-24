@@ -1,146 +1,405 @@
+"""NPU backend implementation for Mobilint hardware accelerators.
+
+Provides the :class:`MobilintNPUBackend` class which wraps the ``qbruntime``
+library to load, configure, and run MXQ models on Mobilint NPU devices.
+
+The backend can host ``N`` :class:`~qbruntime.Model` instances across one or
+more :class:`~qbruntime.Accelerator` handles. ``N`` is derived from
+``max_batch_size`` and the compiled batch axis ``K`` probed from the first
+loaded slot (``N = ceil(max_batch_size / K)``). Slots are distributed across
+the unique devices referenced by the canonical target strings in round-robin
+order, and per-device accelerators are shared. ``Model.infer`` is blocking, so
+callers that want concurrent NPU utilization thread their dispatches across
+:meth:`MobilintNPUBackend.infer_slot` calls.
+
+Target-topology fields (``dev_no`` / ``core_mode`` / ``target_cores`` /
+``target_clusters``) are accumulated on a :class:`NPUTargetSpecPending`
+override log at ``self._pending``. Every per-field setter records its raw
+value on the pending log without normalizing; the canonical
+:class:`NPUTargetSpec` is materialized lazily on read of :attr:`_spec` (and
+cached on ``self._finalized`` until the next setter). This deferral
+eliminates both the partial-state race between fields AND the setter-order
+race that eager per-setter renormalization forced on the previous design.
+
+Backwards compatibility: for callers written against a single ``Model`` /
+``Accelerator`` handle, :attr:`~MobilintNPUBackend.mxq_model` and
+:attr:`~MobilintNPUBackend.acc` remain accessible and refer to the first slot.
+"""
+
 import logging
+import math
 import os
-from typing import Any, Dict, List, Literal, Optional, Sequence, Union
+import re
+import sys
+from typing import Any, Dict, List, Literal, Optional, Union
 
 from huggingface_hub import HfApi, hf_hub_download
 from huggingface_hub.errors import EntryNotFoundError
-from qbruntime import Accelerator, Cluster, Core, CoreId, Model, ModelConfig
+from qbruntime import (
+    Accelerator,
+    Cluster,
+    Core,
+    CoreId,
+    Model,
+    ModelConfig,
+    QbRuntimeError,
+)
 
+from .core_mode import CoreMode, normalize_core_mode
 from .logging import log_model_details
+from .npu_target import (
+    NPUTargetSpec,
+    NPUTargetSpecPending,
+    cluster_map,
+    cluster_to_int,
+    core_map,
+    core_to_int,
+)
 
 logger = logging.getLogger(__name__)
-
-
-def _enum_value(value: Any) -> int:
-    """Return an integer enum value across qbruntime binding versions."""
-
-    while hasattr(value, "value"):
-        value = value.value
-    return int(value)
-
-
-# qbruntime has shipped both a Python enum wrapping a native enum and a direct
-# enum binding. Peel every ``.value`` layer so serialized fields are stable
-# integers across both forms (Cluster0 is 65536; Core0 is 1).
-cluster_map = {
-    _enum_value(cluster): cluster for cluster in (Cluster.Cluster0, Cluster.Cluster1)
-}
-core_map = {
-    _enum_value(core): core for core in (Core.Core0, Core.Core1, Core.Core2, Core.Core3)
-}
 
 
 DEFAULT_TARGET_DEVICE = "aries-rb"
 """Default supported Mobilint NPU board."""
 
-_TARGET_DEVICE_ALIASES = {
-    # Configurations written before board-specific target devices were exposed
-    # used these generic product names. Keep them readable, but always serialize
-    # one of the supported board identifiers below.
-    "aries": "aries-rb",
-    "regulus": "regulus-ra",
-}
+_TARGET_DEVICE_ALIASES = {"aries": "aries-rb", "regulus": "regulus-ra"}
 
 
 def normalize_target_device(target_device: str) -> str:
-    """Return a supported board identifier, accepting legacy generic product names."""
-
+    """Normalize a board identifier while accepting legacy product aliases."""
     if not isinstance(target_device, str):
         raise TypeError(
             f"target_device must be a string, got {type(target_device).__name__}."
         )
-    return _TARGET_DEVICE_ALIASES.get(target_device.lower(), target_device.lower())
+    normalized = _TARGET_DEVICE_ALIASES.get(
+        target_device.lower(), target_device.lower()
+    )
+    if normalized not in {"aries-rb", "regulus-ra", "regulus-rb"}:
+        raise ValueError(f"unknown target_device {target_device!r}")
+    return normalized
+
+
+def _is_qbruntime_bad_alloc(exc: BaseException) -> bool:
+    """Return True when ``exc`` looks like a device-memory ``BadAlloc`` failure.
+
+    ``qbruntime`` exposes a single :class:`~qbruntime.QbRuntimeError` class for
+    every runtime failure it can raise (device-memory ``BadAlloc``, invalid
+    MXQ artifact, incompatible target configuration, corrupted artifact,
+    missing runtime dependency, ...). The ``BadAlloc`` signal only lives
+    inside the error message, so we detect it by looking for the
+    ``BadAlloc`` token case-insensitively and ignoring interior whitespace to
+    be resilient to slight formatting differences across ``qbruntime``
+    versions. Isolated as a helper so a future ``BadAllocError`` subclass can
+    replace this check in one place.
+    """
+    message = str(exc) if exc is not None else ""
+    return "badalloc" in message.lower().replace(" ", "")
+
+
+def _make_core_id(cluster: "Cluster", core: "Core") -> "CoreId":
+    """Create ``CoreId`` across qbruntime constructor variants."""
+    try:
+        return CoreId(cluster, core)
+    except TypeError:
+        result = CoreId()
+        result.cluster = cluster
+        result.core = core
+        return result
+
+
+class MobilintBackendAllocError(RuntimeError):
+    """Raised when a multi-slot backend fails to create or launch a slot.
+
+    Fires for ``qbruntime`` device-memory ``BadAlloc`` failures during
+    :meth:`MobilintNPUBackend.create` / :meth:`~MobilintNPUBackend.launch`,
+    and for :meth:`~MobilintNPUBackend._probe_k_per_model` runtime errors
+    on slot 0 (which prevent :meth:`~MobilintNPUBackend.create` from
+    computing ``N`` safely). Any other :class:`~qbruntime.QbRuntimeError`
+    (invalid MXQ, bad target configuration, corrupted artifact, missing
+    runtime dependency, ...) is re-raised unchanged so callers can
+    distinguish a memory ceiling from a user-config or artifact bug.
+
+    Carries enough context (phase, slot index, device, how many slots had
+    already succeeded, current sizing knobs) to help the caller locate the
+    device memory boundary and pick a safer ``max_batch_size``.
+
+    Attributes:
+        phase: ``"create"`` when :func:`~qbruntime.Model` construction failed,
+            ``"launch"`` when :meth:`~qbruntime.Model.launch` failed,
+            ``"probe_k_per_model"`` when the slot 0 K probe raised.
+        slot: Zero-indexed slot at which the failure happened.
+        dev: Device number that the failing slot was assigned to.
+        succeeded_so_far: Number of slots that completed the same phase
+            before the failure. For ``"probe_k_per_model"`` this is ``1``
+            (slot 0 was loaded before the probe fired).
+        n_total: Planned total slot count for this backend. For
+            ``"probe_k_per_model"`` this is ``0`` because ``N`` could
+            not be computed.
+        max_batch_size: The ``max_batch_size`` requested by the caller.
+        k_per_model: The compiled batch axis ``K`` probed from slot 0. May
+            be ``1`` when the slot 0 probe itself failed.
+        original: The original :class:`~qbruntime.QbRuntimeError` that fired.
+    """
+
+    def __init__(
+        self,
+        phase: str,
+        slot: int,
+        dev: int,
+        succeeded_so_far: int,
+        n_total: int,
+        max_batch_size: int,
+        k_per_model: int,
+        original: BaseException,
+    ) -> None:
+        self.phase = phase
+        self.slot = slot
+        self.dev = dev
+        self.succeeded_so_far = succeeded_so_far
+        self.n_total = n_total
+        self.max_batch_size = max_batch_size
+        self.k_per_model = k_per_model
+        self.original = original
+        if phase == "probe_k_per_model":
+            tail = (
+                "The K probe failed before N could be computed; investigate the underlying "
+                "qbruntime error rather than treating this as a memory ceiling."
+            )
+        else:
+            tail = "If this is a BadAlloc, lower max_batch_size or spread the workload across more devices."
+        message = (
+            f"[Mobilint] NPU backend {phase} failed at slot {slot} on device {dev} "
+            f"(succeeded {succeeded_so_far}/{n_total}). "
+            f"max_batch_size={max_batch_size}, k_per_model={k_per_model}. "
+            f"Original qbruntime error: {original}. " + tail
+        )
+        super().__init__(message)
 
 
 class MobilintNPUBackend:
-    """Shared NPU access. Subclassed per product, because core allocation differs.
+    """Backend that runs one or more MXQ models on Mobilint NPU devices.
 
-    The SDK exposes every core-mode setter on `ModelConfig` regardless of product
-    and offers no capability query, so "does this device support global8" is only
-    answerable by trying it and reading a load failure. Aries has two clusters of
-    four cores and four modes; Regulus has one core and only single. Encoding that
-    in types is what turns a late `StatusCode(16)` into an argument error.
+    Wraps the ``qbruntime`` ``Model`` and ``Accelerator`` APIs and provides
+    helpers for locating MXQ model files either locally or on HuggingFace Hub.
+    A single backend instance manages up to ``N`` model slots across one or
+    more accelerators; slot 0 is the compatibility default consumed by
+    :meth:`__call__`, :meth:`get_dtype`, and :meth:`get_input_buffer_info`.
 
-    Instantiating this class directly selects a backend from ``target_device``.
-    The default is ``aries-rb``; ``regulus-ra`` and ``regulus-rb`` select the
-    Regulus implementation. Existing generic ``aries`` and ``regulus`` config
-    values remain accepted as input compatibility aliases.
+    Class Attributes:
+        num_of_clusters: Total number of hardware clusters available per device.
+        num_of_cores_in_cluster: Number of cores per cluster.
     """
 
-    # Aries geometry. Overridden per product.
     num_of_clusters = 2
     num_of_cores_in_cluster = 4
 
-    #: Core modes this product accepts. Empty on the base class, which never runs.
-    supported_core_modes: tuple = ()
-    #: Default board when this subclass is instantiated directly.
-    default_target_device: str = DEFAULT_TARGET_DEVICE
-    #: Board identifiers accepted by this backend implementation.
-    supported_target_devices: tuple[str, ...] = ()
+    default_target_device = DEFAULT_TARGET_DEVICE
+    supported_target_devices = ("aries-rb", "regulus-ra", "regulus-rb")
 
-    def __new__(cls, *args, **kwargs):
-        # MobilintNPUBackend(...) remains the public construction point. The
-        # board identifier picks its implementation.
+    def __new__(cls, *args: Any, **kwargs: Any):
+        """Select a board-specific backend while retaining the legacy constructor."""
         if cls is MobilintNPUBackend:
-            # ``target_device`` is the eighth positional parameter of
-            # ``__init__`` as well as a keyword argument. Respect either form
-            # before selecting the product-specific implementation.
-            requested_device = kwargs.get("target_device")
-            if requested_device is None and len(args) > 7:
-                requested_device = args[7]
-            requested_device = requested_device or DEFAULT_TARGET_DEVICE
-            device = normalize_target_device(requested_device)
-            cls = backend_class_for(device)
+            target_device = kwargs.get("target_device")
+            if target_device is None and len(args) > 7:
+                target_device = args[7]
+            cls = backend_class_for(target_device or DEFAULT_TARGET_DEVICE)
         return super().__new__(cls)
 
     def __init__(
         self,
         mxq_path: str = "",
-        dev_no: int = 0,
-        core_mode: Literal["auto", "single", "multi", "global4", "global8"] = "single",
+        dev_no: Optional[Union[int, List[int]]] = None,
+        core_mode: CoreMode = "single",
         target_cores: Optional[List[Union[str, "CoreId"]]] = None,
-        target_clusters: Optional[Sequence[Union[int, "Cluster"]]] = None,
+        target_clusters: Optional[List[Union[int, str, "Cluster"]]] = None,
         revision: Optional[str] = None,
         commit_hash: Optional[str] = None,
-        target_device: str | None = None,
+        target_device: Optional[str] = None,
+        max_batch_size: int = 1,
         **kwargs,
     ):
-        resolved_target_device = normalize_target_device(
+        """Initializes the NPU backend configuration.
+
+        Args:
+            mxq_path: Path to the compiled MXQ model file.
+            dev_no: Accelerator device number(s). Accepts either a single
+                index or a list of indices. Callers that pass the fully
+                qualified target strings (``"d:c:k"`` / ``"d:c"``) may
+                also pass a list here to declare the covered device set.
+                Otherwise ``dev_no`` acts as syntactic sugar: it is
+                expanded into ``target_cores`` / ``target_clusters`` when
+                those lists are empty, and prepends the device prefix to
+                legacy 2-part items.
+            max_batch_size: Requested aggregate batch capacity. The backend
+                launches enough slots so that ``N * K >= max_batch_size``,
+                where ``K`` is the compiled batch axis of the MXQ artifact.
+            core_mode: Execution mode that determines how NPU cores are
+                allocated. One of ``"single"``, ``"multi"``, ``"global4"``,
+                or ``"global8"``.
+            target_cores: List of core identifiers used in ``"single"``
+                mode. The canonical form is a fully-qualified
+                ``"d:c:k"`` string (device : cluster : core). Legacy
+                ``"c:k"`` strings and :class:`~qbruntime.CoreId` objects
+                are accepted and rewritten to canonical form using
+                ``dev_no`` as the device prefix. ``None`` leaves the
+                configuration to be filled by ``dev_no`` sugar.
+            target_clusters: List of cluster identifiers used in
+                ``"multi"``, ``"global4"``, and ``"global8"`` modes. The
+                canonical form is a fully-qualified ``"d:c"`` string.
+                Legacy integers, :class:`~qbruntime.Cluster` objects, and
+                bare ``"c"`` strings are accepted and rewritten to
+                canonical form using ``dev_no`` as the device prefix.
+            revision: HuggingFace Hub revision (branch, tag, or commit SHA)
+                to use when downloading the model file.
+            commit_hash: Explicit commit hash for the Hub revision.
+            **kwargs: Additional keyword arguments (ignored; kept for
+                forward-compatibility).
+        """
+        self.name_or_path: str = kwargs.get("name_or_path", "")
+        self.target_device = normalize_target_device(
             target_device or self.default_target_device
         )
-        if resolved_target_device not in self.supported_target_devices:
+        if self.target_device not in self.supported_target_devices:
             raise ValueError(
-                f"target_device {resolved_target_device!r} is not supported by "
-                f"{type(self).__name__}; expected one of "
-                f"{', '.join(self.supported_target_devices)}."
+                f"target_device {self.target_device!r} is not supported by {type(self).__name__}."
             )
-
-        # ``from_dict`` supplies a serialized repository name through ``kwargs``.
-        # Keep it so an MXQ path can still be resolved from the Hub after a
-        # backend round trip; model mixins may replace it later when applicable.
-        self.name_or_path: str = kwargs.get("name_or_path", "")
-        self.target_device = resolved_target_device
         self.revision = revision
         self._commit_hash = commit_hash
         self.mxq_path = mxq_path
-        self.dev_no = dev_no
-        self.core_mode = core_mode
-        if core_mode not in self.supported_core_modes:
-            raise ValueError(
-                f"core_mode {core_mode!r} is not available on "
-                f"{self.target_device}; supported: "
-                f"{', '.join(self.supported_core_modes)}. Refusing here rather than "
-                "letting the SDK fail at Model::create, which is where an "
-                "unsupported mode surfaces otherwise."
-            )
+        self.max_batch_size = max(1, max_batch_size)
 
-        self._target_cores_serialized: List[str] = []
-        self.target_cores = target_cores if target_cores is not None else []
+        # Multi-slot backing state; populated in create()/launch().
+        # ``self.acc`` and ``self.mxq_model`` remain accessible as
+        # compatibility properties that read the first slot.
+        self.accs: Dict[int, "Accelerator"] = {}
+        self.mxq_models: List["Model"] = []
+        self.model_dev_no: List[int] = []
+        self.k_per_model: int = 1
+        self.n_models: int = 0
+        # Cached batched-infer output layout. Populated lazily by
+        # :attr:`output_layout` from the compiled MXQ shape probe or the
+        # runtime fallback in :mod:`multi_slot_dispatch`.
+        self._output_layout_cached: Optional[Literal["n_items", "n_tokens"]] = None
 
-        self._target_clusters_serialized: List[str] = []
-        self.target_clusters = target_clusters if target_clusters is not None else []
+        # Build the initial canonical :class:`NPUTargetSpec` from the ctor
+        # payload (the config layer already has the whole picture at once,
+        # so eager normalization is unambiguous), then wrap it in a
+        # :class:`NPUTargetSpecPending` so subsequent per-field setter
+        # chains can accumulate raw overrides *without* renormalizing
+        # between fields. ``self._finalized`` caches the resolved canonical
+        # spec until a setter invalidates it.
+        #
+        # ``dev_no=None`` means "not given by the caller" — the sentinel
+        # keeps :meth:`NPUTargetSpec.from_kwargs` from running its
+        # device-set consistency check against a defaulted ``dev_no`` when
+        # the caller only supplied ``target_cores`` / ``target_clusters``.
+        spec_kwargs: Dict[str, Any] = {"core_mode": normalize_core_mode(core_mode)}
+        if dev_no is not None:
+            spec_kwargs["dev_no"] = dev_no
+        if target_cores is not None:
+            spec_kwargs["target_cores"] = list(target_cores)
+        if target_clusters is not None:
+            spec_kwargs["target_clusters"] = list(target_clusters)
+        initial_spec = NPUTargetSpec.from_kwargs(spec_kwargs)
+        self._pending: NPUTargetSpecPending = NPUTargetSpecPending(
+            baseline=initial_spec
+        )
+        self._finalized: Optional[NPUTargetSpec] = initial_spec
+
+    # ---- Lazy canonical spec accessor ---------------------------------------
+    #
+    # ``self._spec`` reads the lazily-finalized canonical :class:`NPUTargetSpec`.
+    # First read after a setter (or after init) materializes it from the
+    # accumulated :class:`NPUTargetSpecPending`; subsequent reads hit the
+    # cached copy on ``self._finalized`` until the next setter.
+
+    @property
+    def _spec(self) -> NPUTargetSpec:
+        """Lazily-finalized canonical view of the accumulated target overrides.
+
+        First read after a setter chain materializes the canonical spec by
+        running :meth:`NPUTargetSpecPending.finalize`, then caches it on
+        :attr:`_finalized` until the next setter invalidates the cache.
+
+        Every finalize call also closes the current override epoch: the
+        resolved spec is promoted to a fresh :class:`NPUTargetSpecPending`
+        baseline (see :meth:`NPUTargetSpecPending.from_baseline`), so the
+        next setter chain accumulates on a clean intent slate. Without this
+        promotion, a prior chain's ``target_cores`` override would leak into
+        a standalone ``dev_no`` override in the next chain, and the
+        device-set consistency check inside :func:`_resolve_targets` would
+        fire spuriously. Within a single chain (no accessor read between
+        setters) accumulated overrides finalize as one atomic decision;
+        across chains (accessor reads separate them) each chain sees a clean
+        intent slate.
+        """
+        if self._finalized is None:
+            self._finalized = self._pending.finalize()
+            # Close the current override epoch: the next setter chain
+            # accumulates on a fresh baseline with all intent flags cleared.
+            self._pending = NPUTargetSpecPending.from_baseline(self._finalized)
+        return self._finalized
+
+    # ---- Target-topology accessors ------------------------------------------
+    #
+    # Every setter records its raw override on ``self._pending`` and
+    # invalidates ``self._finalized`` so the next :attr:`_spec` read
+    # materializes the canonical spec once every accumulated override is
+    # visible. HF ``from_pretrained`` fires these setters one field at a
+    # time via ``model_kwargs`` application; the deferred finalize
+    # guarantees the setter order does not matter — the resolved canonical
+    # spec depends only on the *set* of accumulated overrides, not the
+    # sequence.
+
+    @property
+    def dev_no(self) -> Union[int, List[int]]:
+        """User-facing ``dev_no`` (``int`` or ``list[int]``)."""
+        return self._spec.dev_no_public()
+
+    @dev_no.setter
+    def dev_no(self, value: Union[int, List[int]]) -> None:
+        self._pending = self._pending._with(dev_no=value)
+        self._finalized = None
+
+    @property
+    def core_mode(self) -> CoreMode:
+        return self._spec.core_mode
+
+    @core_mode.setter
+    def core_mode(self, value: str) -> None:
+        self._pending = self._pending._with(core_mode=normalize_core_mode(value))
+        self._finalized = None
+
+    @property
+    def _target_cores_serialized(self) -> List[str]:
+        """Canonical ``"d:c:k"`` strings (read-only view backed by ``_spec``)."""
+        return list(self._spec.cores)
+
+    @property
+    def _target_clusters_serialized(self) -> List[str]:
+        """Canonical ``"d:c"`` strings (read-only view backed by ``_spec``)."""
+        return list(self._spec.clusters)
 
     def check_model_path(self, mxq_path: str) -> str:
+        """Resolves the absolute path to an MXQ model file.
+
+        Resolution is attempted in the following order:
+
+        1. The path exists as-is (relative or absolute).
+        2. The path exists relative to ``self.name_or_path`` (local directory).
+        3. The file is downloaded from HuggingFace Hub.
+
+        Args:
+            mxq_path: Filename or relative path of the MXQ model to locate.
+
+        Returns:
+            The resolved absolute path to the MXQ file.
+
+        Raises:
+            EntryNotFoundError: If the file cannot be found on HuggingFace Hub
+                after all fallback strategies are exhausted.
+            Exception: If no strategy succeeds in locating the file.
+        """
         # 1. current relative/absolute path
         if os.path.exists(mxq_path):
             return mxq_path
@@ -177,24 +436,58 @@ class MobilintNPUBackend:
                         revision=revision,
                     )
                 except EntryNotFoundError:
-                    cached = self._find_cached_mxq(name_or_path, mxq_path, revision)
+                    mxq_revision = (
+                        None
+                        if revision is not None
+                        else self._infer_revision_from_mxq_path(mxq_path)
+                    )
+                    if mxq_revision is not None:
+                        try:
+                            return hf_hub_download(
+                                repo_id=name_or_path,
+                                filename=mxq_path,
+                                revision=mxq_revision,
+                            )
+                        except EntryNotFoundError:
+                            pass
+
+                    fallback_revision = revision or mxq_revision
+                    cached = self._find_cached_mxq(
+                        name_or_path, mxq_path, revision=fallback_revision
+                    )
                     if cached is not None:
                         return cached
                     mxq_candidate = self._find_mxq_from_hub(
-                        name_or_path, mxq_path, revision
+                        name_or_path,
+                        mxq_path,
+                        revision=fallback_revision,
                     )
                     if mxq_candidate is None:
                         raise
                     return hf_hub_download(
                         repo_id=name_or_path,
                         filename=mxq_candidate,
-                        revision=revision,
+                        revision=fallback_revision,
                     )
 
         raise Exception(f"[Mobilint] Error: Could not locate {mxq_path}.")
 
     @staticmethod
     def _infer_hf_revision_from_cache(repo_id: str) -> Optional[str]:
+        """Infers a HuggingFace Hub revision from the local cache.
+
+        Searches the HF hub cache directory for the given repository and
+        returns the first commit SHA found by inspecting the ``refs/`` and
+        ``snapshots/`` directories.
+
+        Args:
+            repo_id: HuggingFace repository identifier in ``"owner/repo"``
+                format.
+
+        Returns:
+            A commit SHA string if one is found in the local cache, or
+            ``None`` if the cache cannot be located or read.
+        """
         if not repo_id or "/" not in repo_id:
             return None
 
@@ -243,9 +536,38 @@ class MobilintNPUBackend:
         return None
 
     @staticmethod
+    def _infer_revision_from_mxq_path(mxq_path: str) -> Optional[str]:
+        basename = os.path.basename(mxq_path)
+        stem, ext = os.path.splitext(basename)
+        if ext != ".mxq" or "-" not in stem:
+            return None
+
+        revision = stem.rsplit("-", 1)[-1]
+        if re.fullmatch(r"[A-Za-z]*\d[A-Za-z0-9]*", revision):
+            return revision
+        return None
+
+    @staticmethod
     def _find_cached_mxq(
         repo_id: str, mxq_path: str, revision: Optional[str] = None
     ) -> Optional[str]:
+        """Searches the local HF hub cache for a cached MXQ file.
+
+        Checks each snapshot directory for the given repo, looking first for
+        an exact relative-path match and then for any file whose basename
+        matches. Falls back to scanning the entire snapshot tree for any
+        ``*.mxq`` file.
+
+        Args:
+            repo_id: HuggingFace repository identifier in ``"owner/repo"``
+                format.
+            mxq_path: Expected relative path or basename of the MXQ file
+                within the repository.
+
+        Returns:
+            The absolute filesystem path to the cached file if found, or
+            ``None`` otherwise.
+        """
         if not repo_id or "/" not in repo_id:
             return None
 
@@ -265,10 +587,17 @@ class MobilintNPUBackend:
 
         rel_candidates = [mxq_path, os.path.basename(mxq_path)]
         try:
-            snapshots = os.listdir(snapshots_dir)
+            resolved_revision = revision
             if revision is not None:
-                snapshots = [snapshot for snapshot in snapshots if snapshot == revision]
-            for snapshot in snapshots:
+                ref_path = os.path.join(repo_dir, "refs", revision)
+                try:
+                    with open(ref_path, "r", encoding="utf-8") as ref_file:
+                        resolved_revision = ref_file.read().strip() or revision
+                except OSError:
+                    pass
+            for snapshot in os.listdir(snapshots_dir):
+                if resolved_revision is not None and snapshot != resolved_revision:
+                    continue
                 snapshot_dir = os.path.join(snapshots_dir, snapshot)
                 if not os.path.isdir(snapshot_dir):
                     continue
@@ -297,220 +626,831 @@ class MobilintNPUBackend:
             return mxq_path
 
         raise ValueError(
-            f"Cannot find {mxq_path} file from HuggingFace repo: f{repo_id}"
+            f"Cannot find {mxq_path} file from HuggingFace repo: {repo_id}"
         )
 
-    def _configure_core_mode(self, mc: "ModelConfig") -> None:
-        raise NotImplementedError(
-            "MobilintNPUBackend is a base class; use MobilintAriesBackend, "
-            "MobilintRegulusBackend, or backend_class_for(target_device)."
-        )
+    # ---- Compatibility shims -------------------------------------------------
 
-    def create(self):
-        self.acc = Accelerator(self.dev_no)
-        mc = ModelConfig()
-        self._configure_core_mode(mc)
+    @property
+    def mxq_model(self) -> Optional["Model"]:
+        """First-slot :class:`~qbruntime.Model` handle, or ``None`` before create().
 
-        model_path = self.check_model_path(self.mxq_path)
-        self.mxq_model = Model(model_path, mc)
-        log_model_details(model_path, self)
-
-    def launch(self):
-        self.mxq_model.launch(self.acc)
-
-    def __call__(self, x: Any) -> Any:
-        """Run inference with the loaded MXQ model.
-
-        This compatibility entry point is used by the Vision engine and mirrors
-        the historical Model Zoo backend contract.
+        Preserved for callers written against the pre-multi-slot API
+        (:mod:`cache_utils`, per-model utilities in ``modeling_utils``,
+        etc.). New code that dispatches concurrent slots should read
+        :attr:`mxq_models` directly.
         """
+        return self.mxq_models[0] if self.mxq_models else None
 
-        return self.mxq_model.infer(x)
+    @mxq_model.setter
+    def mxq_model(self, value: Optional["Model"]) -> None:
+        """Map the legacy writable slot-zero handle into ``mxq_models``."""
+        if value is None:
+            self._dispose_all_slots()
+            self.mxq_models = []
+            self.model_dev_no = []
+            self.n_models = 0
+            self.accs = {}
+        elif self.mxq_models:
+            self.mxq_models[0] = value
+        else:
+            self.mxq_models = [value]
+            self.model_dev_no = [self._fallback_dev()]
+            self.n_models = 1
+
+    @property
+    def acc(self) -> Optional["Accelerator"]:
+        """First-inserted accelerator handle, or ``None`` before create()."""
+        if not self.accs:
+            return None
+        return next(iter(self.accs.values()))
+
+    @acc.setter
+    def acc(self, value: Optional["Accelerator"]) -> None:
+        """Map the legacy writable accelerator handle into ``accs``."""
+        if value is None:
+            self.accs = {}
+        else:
+            self.accs[self._fallback_dev()] = value
+
+    # ---- Target helpers ------------------------------------------------------
+
+    def _fallback_dev(self) -> int:
+        """Return a single device index to prepend when migrating legacy target items."""
+        dev = self._spec.dev_no_public()
+        if isinstance(dev, list):
+            return int(dev[0]) if dev else 0
+        return int(dev)
+
+    def _unique_devs_from_targets(self) -> List[int]:
+        """Return the sorted set of device indices referenced by the canonical target lists.
+
+        Falls back to :attr:`dev_no` sugar when both target lists are empty
+        (defensive; :class:`NPUTargetSpec` normally guarantees at least one
+        populated field).
+        """
+        return self._spec.unique_devices()
+
+    def _iter_core_entries(self):
+        """Yield ``(dev, cluster_idx, core_enum, cluster_enum)`` for every valid ``self._spec.cores`` entry.
+
+        Parses canonical ``"d:c:k"`` strings in their internal order.
+        Tolerates a stale legacy 2-part ``"c:k"`` entry that slipped past
+        normalization by assigning it to :meth:`_fallback_dev`. Malformed
+        entries are logged and skipped. Shared by the aggregate
+        :attr:`target_cores` view and the per-device
+        :attr:`target_cores_by_device` view.
+        """
+        for s in self._spec.cores:
+            try:
+                parts = s.split(":")
+                if len(parts) == 3:
+                    d_val, c_val, r_val = int(parts[0]), int(parts[1]), int(parts[2])
+                elif len(parts) == 2:
+                    d_val, c_val, r_val = (
+                        self._fallback_dev(),
+                        int(parts[0]),
+                        int(parts[1]),
+                    )
+                else:
+                    raise ValueError(f"invalid entry: {s}")
+                cluster_enum = cluster_map[c_val]
+                core_enum = core_map[r_val]
+            except Exception as e:
+                logger.warning("Target cores not serialized: %s", s)
+                logger.warning("Error: %s", e)
+                continue
+            yield d_val, c_val, core_enum, cluster_enum
+
+    def _iter_cluster_entries(self):
+        """Yield ``(dev, cluster_enum)`` for every valid ``self._spec.clusters`` entry.
+
+        Parses canonical ``"d:c"`` strings in their internal order.
+        Tolerates a stale legacy bare-int entry by assigning it to
+        :meth:`_fallback_dev`. Malformed entries are logged and skipped.
+        Shared by the aggregate :attr:`target_clusters` view, the
+        per-device :attr:`target_clusters_by_device` view, and the
+        :attr:`target_cores` fallback expansion.
+        """
+        for s in self._spec.clusters:
+            try:
+                if isinstance(s, str) and ":" in s:
+                    d_val, c_val = int(s.split(":")[0]), int(s.split(":")[1])
+                else:
+                    d_val, c_val = self._fallback_dev(), int(s)
+                cluster_enum = cluster_map[c_val]
+            except Exception as e:
+                logger.warning("Target clusters not serialized: %s", s)
+                logger.warning("Error: %s", e)
+                continue
+            yield d_val, cluster_enum
+
+    def filter_cores_for(self, dev: int) -> List["CoreId"]:
+        """Return the :class:`~qbruntime.CoreId` list for cores assigned to ``dev``.
+
+        Reads :attr:`NPUTargetSpec.cores` and yields the entries whose
+        device prefix matches ``dev``. Used to build a per-slot
+        :class:`~qbruntime.ModelConfig` when the backend spans multiple
+        devices.
+        """
+        result: List[CoreId] = []
+        for s in self._spec.cores:
+            parts = s.split(":")
+            if len(parts) != 3:
+                continue
+            try:
+                d_val, c_val, k_val = int(parts[0]), int(parts[1]), int(parts[2])
+            except ValueError:
+                continue
+            if d_val != int(dev):
+                continue
+            try:
+                result.append(_make_core_id(cluster_map[c_val], core_map[k_val]))
+            except KeyError:
+                # Defensive: :func:`_migrate_target_cores` now rejects
+                # out-of-range cluster / core indices at construction time,
+                # so this branch is unreachable for spec values that came
+                # through the migrator. Kept as a safety net in case a
+                # future callsite bypasses the migrator.
+                logger.warning("Unknown cluster/core id in target_cores entry %r", s)
+        return result
+
+    def filter_clusters_for(self, dev: int) -> List["Cluster"]:
+        """Return the :class:`~qbruntime.Cluster` list for clusters assigned to ``dev``.
+
+        Reads :attr:`NPUTargetSpec.clusters` and yields the entries whose
+        device prefix matches ``dev``. Used to build a per-slot
+        :class:`~qbruntime.ModelConfig` for ``multi``/``global4``/``global8``
+        modes.
+        """
+        result: List[Cluster] = []
+        for s in self._spec.clusters:
+            if not isinstance(s, str) or ":" not in s:
+                continue
+            try:
+                d_val, c_val = int(s.split(":", 1)[0]), int(s.split(":", 1)[1])
+            except ValueError:
+                continue
+            if d_val != int(dev):
+                continue
+            try:
+                result.append(cluster_map[c_val])
+            except KeyError:
+                logger.warning("Unknown cluster id in target_clusters entry %r", s)
+        return result
+
+    # ---- Slot lifecycle ------------------------------------------------------
+
+    def _make_slot_config(self, dev: int) -> "ModelConfig":
+        """Build a :class:`~qbruntime.ModelConfig` restricted to ``dev``'s targets.
+
+        Args:
+            dev: Device index this slot is assigned to.
+
+        Raises:
+            ValueError: If ``self.core_mode`` is not one of the supported values.
+            AssertionError: If ``"global8"`` mode is requested and ``dev`` does
+                not carry both clusters.
+        """
+        mc = ModelConfig()
+        if self.core_mode == "auto":
+            mc.set_auto_core_mode()
+        elif self.core_mode == "single":
+            mc.set_single_core_mode(None, self.filter_cores_for(dev))
+        elif self.core_mode == "multi":
+            mc.set_multi_core_mode(self.filter_clusters_for(dev))
+        elif self.core_mode == "global4":
+            mc.set_global4_core_mode(self.filter_clusters_for(dev))
+        elif self.core_mode == "global8":
+            clusters = self.filter_clusters_for(dev)
+            assert (
+                len(clusters) == 2
+            ), f"core_mode='global8' requires both clusters on device {dev}; got {len(clusters)}."
+            mc.set_global8_core_mode()
+        else:
+            raise ValueError(f"Unsupported core_mode {self.core_mode!r}.")
+        return mc
+
+    @staticmethod
+    def _probe_k_per_model(mxq_model: "Model") -> int:
+        """Return the compiled batch axis ``K`` of ``mxq_model``, defaulting to ``1``.
+
+        Reads :meth:`~qbruntime.Model.get_cache_infos` and returns the
+        ``num_batches`` field of the first per-layer cache info entry.
+        This is the authoritative K probe for LLM MXQs — the input shape
+        of a batched LLM MXQ is ``(1, -1, hidden)``, so the leading input
+        dimension cannot distinguish batched from non-batched artifacts.
+
+        For MXQ artifacts without KV cache layers (e.g. vision models),
+        :meth:`~qbruntime.Model.get_cache_infos` returns an empty list and
+        the fallback of ``1`` is correct because there is no compiled
+        batch axis to fan out along.
+
+        Exception policy distinguishes API-availability from runtime-signal:
+        :class:`AttributeError` (old ``qbruntime`` releases missing the API)
+        falls back to ``K=1`` because the artifact classification is unknown
+        but the missing API is a version signal, not an artifact signal. A
+        :class:`~qbruntime.QbRuntimeError` from a live API is a genuine
+        runtime unknown and propagates — silently classifying a batched LLM
+        artifact as non-batch would trick :meth:`create` into launching
+        ``N = max_batch_size`` slots and hitting a device-memory ``BadAlloc``,
+        surfacing a misleading root cause. :meth:`create` catches the
+        propagated error, disposes slot 0, and re-raises as
+        :class:`MobilintBackendAllocError` with ``phase="probe_k_per_model"``.
+
+        Raises:
+            QbRuntimeError: If :meth:`~qbruntime.Model.get_cache_infos` fires
+                a runtime error. Callers must handle rollback.
+        """
+        try:
+            infos = mxq_model.get_cache_infos()
+        except AttributeError as exc:
+            # Old ``qbruntime`` releases predating :meth:`get_cache_infos`.
+            # The missing API is a version signal, not an artifact signal,
+            # so falling back to ``K=1`` is safe: the compiled batch axis
+            # is unknown but the caller cannot ask the runtime any better
+            # question. On newer runtimes this branch is unreachable.
+            logger.warning(
+                "qbruntime.Model.get_cache_infos not available; assuming K=1: %s", exc
+            )
+            return 1
+        if not infos:
+            return 1
+        first = infos[0]
+        try:
+            k = int(getattr(first, "num_batches", 1) or 1)
+        except (TypeError, ValueError):
+            return 1
+        return k if k > 0 else 1
+
+    def _dispose_all_slots(self) -> None:
+        """Dispose every previously-created Model, swallowing individual failures.
+
+        The release path must not raise: callers use this both on normal
+        teardown and on the rollback path after a partial ``create``/``launch``
+        failure.
+        """
+        for m in self.mxq_models:
+            try:
+                m.dispose()
+            except Exception as exc:  # noqa: BLE001 — release path must not raise.
+                logger.warning("dispose failed during rollback: %s", exc)
+        self.mxq_models = []
+        self.model_dev_no = []
+
+    def create(self) -> None:
+        """Instantiate accelerators and load ``N`` MXQ Model slots.
+
+        Groups the canonical target strings by device, opens one
+        :class:`~qbruntime.Accelerator` per unique device, and loads
+        ``N = ceil(max_batch_size / K)`` :class:`~qbruntime.Model` slots
+        round-robin across those devices. ``K`` is probed from slot 0.
+        The MXQ artifact is resolved via :meth:`check_model_path` exactly
+        once; the resolved path is reused by every subsequent slot.
+
+        On a device-memory ``BadAlloc`` (see :func:`_is_qbruntime_bad_alloc`),
+        every previously loaded slot is disposed and the failure is rethrown
+        as :class:`MobilintBackendAllocError` with slot / device / progress
+        context. Any other :class:`~qbruntime.QbRuntimeError` (invalid MXQ
+        artifact, incompatible target configuration, corrupted artifact,
+        missing runtime dependency, ...) triggers the same partial-state
+        rollback but is re-raised unchanged so the caller can distinguish
+        a memory ceiling from a user-config or artifact bug.
+
+        If the slot 0 K probe (:meth:`_probe_k_per_model`) itself raises a
+        :class:`~qbruntime.QbRuntimeError`, ``N`` cannot be computed safely
+        — silently defaulting to ``K=1`` would over-provision slots on a
+        batched LLM artifact and later surface as a misleading ``BadAlloc``.
+        Slot 0 is disposed unconditionally; a device-memory ``BadAlloc``
+        during the probe is rethrown as :class:`MobilintBackendAllocError`
+        with ``phase="probe_k_per_model"``, while any other qbruntime
+        failure (invalid MXQ, incompatible target configuration, corrupted
+        artifact, missing runtime dependency, ...) is re-raised unchanged
+        so the caller can distinguish a real allocation ceiling from a
+        user-config or artifact bug.
+
+        Raises:
+            MobilintBackendAllocError: If any slot hits a device-memory
+                ``BadAlloc`` or the slot 0 K probe hits a ``BadAlloc``.
+            QbRuntimeError: If any slot or the slot 0 K probe fails for a
+                non-alloc reason (after partial-state rollback).
+            ValueError: If ``self.core_mode`` is not one of the supported
+                values.
+            AssertionError: If ``"global8"`` mode is requested but a device
+                does not cover both clusters.
+        """
+        unique_devs = self._unique_devs_from_targets()
+        if not unique_devs:
+            unique_devs = [self._fallback_dev()]
+
+        self.accs = {int(d): Accelerator(int(d)) for d in unique_devs}
+        self.mxq_models = []
+        self.model_dev_no = []
+        self.n_models = 0
+        # Output layout is a fixed property of the compiled MXQ probed once
+        # from slot 0. A dispose() + create() cycle may swap the artifact,
+        # so invalidate any prior probe before loading new slots.
+        self._output_layout_cached = None
+
+        resolved_path: Optional[str] = None
+
+        def _spawn_slot(slot_idx: int, dev: int) -> "Model":
+            nonlocal resolved_path
+            if resolved_path is None:
+                resolved_path = self.check_model_path(self.mxq_path)
+            mc = self._make_slot_config(dev)
+            try:
+                m = Model(resolved_path, mc)
+            except QbRuntimeError as exc:
+                succeeded = len(self.mxq_models)
+                planned = max(self.n_models, slot_idx + 1)
+                self._dispose_all_slots()
+                self.accs = {}
+                if _is_qbruntime_bad_alloc(exc):
+                    raise MobilintBackendAllocError(
+                        phase="create",
+                        slot=slot_idx,
+                        dev=int(dev),
+                        succeeded_so_far=succeeded,
+                        n_total=planned,
+                        max_batch_size=self.max_batch_size,
+                        k_per_model=self.k_per_model,
+                        original=exc,
+                    ) from exc
+                # Non-alloc runtime failure (invalid MXQ, bad target config,
+                # corrupted artifact, ...). Report progress on stderr so the
+                # caller sees which slot broke, then re-raise unchanged.
+                print(
+                    f"[Mobilint] NPU backend create failed at slot {slot_idx} on device {dev} "
+                    f"(succeeded {succeeded}/{planned}); re-raising qbruntime error unchanged.",
+                    file=sys.stderr,
+                )
+                raise
+            self.mxq_models.append(m)
+            self.model_dev_no.append(int(dev))
+            return m
+
+        # Slot 0 tells us the compiled batch axis, which sets N for the
+        # remaining slots.
+        first_dev = int(unique_devs[0])
+        first_model = _spawn_slot(0, first_dev)
+        try:
+            self.k_per_model = self._probe_k_per_model(first_model)
+        except QbRuntimeError as exc:
+            # K probe failure means we cannot compute ``n_models`` safely.
+            # Silently defaulting to ``K=1`` would over-provision slots on a
+            # batched LLM artifact and surface later as a misleading
+            # ``BadAlloc``. Dispose slot 0 unconditionally so a retry does not
+            # double-load. A device-memory ``BadAlloc`` at this point is a
+            # real allocation ceiling and must be wrapped as
+            # :class:`MobilintBackendAllocError` (``phase="probe_k_per_model"``)
+            # so the benchmark records ``skipped_reason=npu_alloc`` and asks
+            # the user to lower ``max_batch_size``. Any other qbruntime error
+            # (invalid MXQ, incompatible target configuration, corrupted
+            # artifact, missing runtime dependency, ...) is re-raised
+            # unchanged so the benchmark records ``skipped_reason=npu_runtime``
+            # with the actionable detail instead of hiding it behind an
+            # allocation-sounding hint.
+            self._dispose_all_slots()
+            self.accs = {}
+            if _is_qbruntime_bad_alloc(exc):
+                raise MobilintBackendAllocError(
+                    phase="probe_k_per_model",
+                    slot=0,
+                    dev=int(first_dev),
+                    succeeded_so_far=1,
+                    n_total=0,
+                    max_batch_size=self.max_batch_size,
+                    k_per_model=1,
+                    original=exc,
+                ) from exc
+            print(
+                f"[Mobilint] NPU backend K probe failed on device {first_dev} "
+                f"during slot 0 setup; re-raising qbruntime error unchanged.",
+                file=sys.stderr,
+            )
+            raise
+        self.n_models = max(
+            1, math.ceil(self.max_batch_size / max(1, self.k_per_model))
+        )
+
+        for slot_idx in range(1, self.n_models):
+            d = int(unique_devs[slot_idx % len(unique_devs)])
+            _spawn_slot(slot_idx, d)
+
+        # ``resolved_path`` is set by the first _spawn_slot call above.
+        assert resolved_path is not None
+        log_model_details(resolved_path, self)
+
+    def launch(self) -> None:
+        """Launch every loaded slot on its assigned accelerator.
+
+        Must be called after :meth:`create`. On a device-memory ``BadAlloc``
+        (see :func:`_is_qbruntime_bad_alloc`), every previously launched slot
+        is disposed and the failure is rethrown as
+        :class:`MobilintBackendAllocError`. Any other
+        :class:`~qbruntime.QbRuntimeError` (invalid MXQ, bad target
+        configuration, corrupted artifact, missing runtime dependency, ...)
+        triggers the same partial-state rollback but is re-raised unchanged
+        so the caller can distinguish a real memory ceiling from a
+        user-config or artifact bug.
+
+        Raises:
+            MobilintBackendAllocError: If any slot hits a device-memory
+                ``BadAlloc`` while launching.
+            QbRuntimeError: If any slot fails to launch for a non-alloc
+                reason (after partial-state rollback).
+        """
+        if not self.mxq_models:
+            raise RuntimeError(
+                "MobilintNPUBackend.launch() requires create() to succeed first."
+            )
+
+        for i, m in enumerate(self.mxq_models):
+            d = self.model_dev_no[i]
+            try:
+                m.launch(self.accs[d])
+            except QbRuntimeError as exc:
+                self._dispose_all_slots()
+                self.accs = {}
+                if _is_qbruntime_bad_alloc(exc):
+                    raise MobilintBackendAllocError(
+                        phase="launch",
+                        slot=i,
+                        dev=int(d),
+                        succeeded_so_far=i,
+                        n_total=self.n_models,
+                        max_batch_size=self.max_batch_size,
+                        k_per_model=self.k_per_model,
+                        original=exc,
+                    ) from exc
+                # Non-alloc runtime failure — see :meth:`create` for the
+                # rationale. Report progress on stderr then re-raise unchanged.
+                print(
+                    f"[Mobilint] NPU backend launch failed at slot {i} on device {d} "
+                    f"(succeeded {i}/{self.n_models}); re-raising qbruntime error unchanged.",
+                    file=sys.stderr,
+                )
+                raise
+
+    def __call__(self, x):
+        """Runs inference on slot 0.
+
+        Preserved as a backward-compat shim for callers written against
+        the single-slot API. New multi-slot callers should use
+        :meth:`infer_slot` and manage cross-slot dispatch themselves
+        because ``Model.infer`` is blocking.
+
+        Args:
+            x: Input data to pass to slot 0.
+
+        Returns:
+            The raw inference output produced by slot 0.
+        """
+        return self.mxq_models[0].infer(x)
+
+    def infer_slot(self, i: int, x):
+        """Runs inference on slot ``i``.
+
+        Blocking. Callers that want to overlap slots must submit
+        ``infer_slot`` calls from independent threads.
+
+        Args:
+            i: Slot index in ``[0, self.n_models)``.
+            x: Input data to pass to that slot's Model.
+
+        Returns:
+            The raw inference output produced by slot ``i``.
+        """
+        return self.mxq_models[i].infer(x)
 
     def get_dtype(self) -> str:
-        """Return the loaded model input data type as a runtime string."""
+        """Returns the input data type of slot 0 (identical across slots).
 
-        return str(self.mxq_model.get_model_input_data_type())
+        Returns:
+            A string representation of slot 0's input
+            :class:`~qbruntime.DataType` (e.g. ``"DataType.Uint8"``).
+        """
+        return str(self.mxq_models[0].get_model_input_data_type())
 
-    def dispose(self):
-        self.mxq_model.dispose()
+    def get_input_buffer_info(self):
+        """Returns the input buffer info of slot 0 (identical across slots).
+
+        Returns:
+            The ``get_input_buffer_info()`` return value produced by
+            :class:`~qbruntime.Model` for slot 0.
+        """
+        return self.mxq_models[0].get_input_buffer_info()
+
+    # ---- Output layout probe ------------------------------------------------
+
+    @property
+    def output_layout(self) -> Optional[Literal["n_items", "n_tokens"]]:
+        """Return the compiled batched-infer output layout, or ``None`` when unknown.
+
+        Two layouts show up in practice for a batched LLM MXQ call:
+        ``"n_items"`` (one row per active batch item — a static last-token
+        MXQ, or a dynamic-axis kernel that collapses the token axis for
+        batched dispatch) and ``"n_tokens"`` (one row per input token,
+        emitted by a truly dynamic-axis MXQ).
+
+        The layout is a fixed property of the compiled MXQ — every slot in
+        the backend runs the same artifact — so we probe it once from slot
+        0's :meth:`qbruntime.Model.get_model_output_shape` output and cache
+        the result. When the shape probe is ambiguous or the accessor is
+        missing, this returns ``None`` and :class:`MultiSlotDispatcher`
+        falls back to inspecting an unambiguous runtime group and pins the
+        answer via :meth:`_set_output_layout` for the remainder of the
+        process. Never defaults silently.
+        """
+        cached = self._output_layout_cached
+        if cached is not None:
+            return cached
+        probed = self._probe_output_layout()
+        if probed is not None:
+            self._output_layout_cached = probed
+        return probed
+
+    def _set_output_layout(self, layout: Literal["n_items", "n_tokens"]) -> None:
+        """Cache the runtime-observed output layout for the rest of this backend's life."""
+        if layout not in ("n_items", "n_tokens"):
+            raise ValueError(f"invalid output layout: {layout!r}")
+        self._output_layout_cached = layout
+
+    def _probe_output_layout(self) -> Optional[Literal["n_items", "n_tokens"]]:
+        """Probe the batched output layout from slot 0's compiled shape.
+
+        LLM MXQs declare their token axis at index ``-2`` of the first
+        output shape. A ``-1`` sentinel marks the axis as dynamic (per-token
+        streaming; layout is ``"n_tokens"``); any static value collapses
+        the token axis to a single row per batch item (layout ``"n_items"``).
+
+        A ``K > 1`` batched MXQ complicates the probe: the compiled batch
+        axis can occupy position ``-2`` and be reported dynamic even though
+        the runtime still emits per-item last-token logits (``"n_items"``).
+        Shape metadata alone cannot distinguish "token axis dynamic" from
+        "batch axis dynamic," so ``K > 1`` + dynamic ``-2`` returns ``None``
+        and defers to the :class:`MultiSlotDispatcher` runtime fallback,
+        which pins the answer from an unambiguous group.
+
+        Returns ``None`` when the shape accessor is missing / errors, when
+        the first output has fewer than two dims, or when the probe is
+        ambiguous (see above) — the runtime fallback then pins the answer.
+        """
+        if not self.mxq_models:
+            return None
+        first = self.mxq_models[0]
+        try:
+            shapes = first.get_model_output_shape()
+        except (AttributeError, QbRuntimeError) as exc:
+            # Best-effort probe: any qbruntime failure here (BadAlloc or not)
+            # is non-fatal — the dispatcher's runtime fallback pins the layout
+            # from the first unambiguous group instead.
+            logger.debug("output_layout: get_model_output_shape unavailable (%s)", exc)
+            return None
+        if not shapes:
+            return None
+        first_shape = tuple(shapes[0])
+        if len(first_shape) < 2:
+            return None
+        try:
+            token_axis = int(first_shape[-2])
+        except (TypeError, ValueError):
+            return None
+        if token_axis != -1:
+            return "n_items"
+        if self.k_per_model > 1:
+            # Ambiguous: the ``-1`` at position -2 could be the compiled batch
+            # axis (K) rather than the token axis. Defer to the runtime
+            # fallback rather than lock the wrong layout.
+            return None
+        return "n_tokens"
+
+    def dispose(self) -> None:
+        """Release every model and accelerator handle held by this backend.
+
+        Safe to call multiple times.
+        """
+        self._dispose_all_slots()
+        self.accs = {}
 
     @property
     def target_cores(self) -> List["CoreId"]:
-        result = []
-        if not hasattr(self, "_target_cores_serialized"):
-            return []
+        """Deserialize and return the target :class:`~qbruntime.CoreId` objects across every device.
 
-        for s in self._target_cores_serialized:
-            try:
-                c_val, r_val = map(int, s.split(":"))
-                if c_val in (0, 1):
-                    cluster = (Cluster.Cluster0, Cluster.Cluster1)[c_val]
-                    core = (Core.Core0, Core.Core1, Core.Core2, Core.Core3)[r_val]
-                else:
-                    cluster = cluster_map[c_val]
-                    core = core_map[r_val]
-                core_id_factory: Any = CoreId
-                try:
-                    # qbruntime's current binding exposes a no-argument
-                    # constructor, although older type stubs declare only the
-                    # legacy two-argument form.
-                    core_id = core_id_factory()
-                    core_id.cluster = cluster
-                    core_id.core = core
-                except TypeError:
-                    core_id = CoreId(cluster, core)
-                result.append(core_id)
-            except Exception as e:
-                # Raising rather than warning-and-skipping: this used to drop the
-                # entry and return a shorter list, so a caller who asked for two
-                # specific cores silently got none and ran on whatever the default
-                # allocation gave them.
-                raise ValueError(
-                    f"cannot deserialize target core {s!r}: expected "
-                    f'"<cluster value>:<core value>" with cluster in '
-                    f"{sorted(cluster_map)} and core in {sorted(core_map)}"
-                ) from e
+        Cores are stored internally on ``self._spec`` as canonical
+        ``"d:c:k"`` strings. The aggregate view includes entries from
+        every device covered by the backend and preserves the internal
+        ordering of ``self._spec.cores``. The device prefix is discarded
+        in the return type; callers that need per-device provenance
+        should read :attr:`target_cores_by_device` or the canonical
+        :attr:`_target_cores_serialized` list.
+
+        When no explicit per-core list has been set, the getter falls back
+        to expanding ``target_clusters`` into every core of each listed
+        cluster. This preserves the historical ``target_clusters=[0, 1]``
+        short-hand for "use all 8 cores across both clusters" in
+        ``single`` core mode without listing every core by hand, and
+        extends it across every device covered by the backend.
+
+        Returns:
+            A list of :class:`~qbruntime.CoreId` objects representing the
+            NPU cores selected on every device this backend covers.
+        """
+        result: List["CoreId"] = []
+        for _dev, _cluster_idx, core_enum, cluster_enum in self._iter_core_entries():
+            result.append(_make_core_id(cluster_enum, core_enum))
+        if result:
+            return result
+
+        # Fallback: expand target_clusters into their full 4-core set on
+        # every covered device. Only kicks in when the caller left
+        # target_cores empty.
+        for _dev, cluster_enum in self._iter_cluster_entries():
+            for core_enum in (Core.Core0, Core.Core1, Core.Core2, Core.Core3):
+                result.append(_make_core_id(cluster_enum, core_enum))
         return result
 
     @target_cores.setter
-    def target_cores(self, values: List[Union[str, "CoreId"]]):
-        serialized = []
-        for v in values:
-            if isinstance(v, CoreId):
-                cluster_index = next(
-                    index
-                    for index, cluster in enumerate(
-                        (Cluster.Cluster0, Cluster.Cluster1)
-                    )
-                    if _enum_value(cluster) == _enum_value(v.cluster)
-                )
-                core_index = next(
-                    index
-                    for index, core in enumerate(
-                        (Core.Core0, Core.Core1, Core.Core2, Core.Core3)
-                    )
-                    if _enum_value(core) == _enum_value(v.core)
-                )
-                serialized.append(f"{cluster_index}:{core_index}")
-            elif isinstance(v, str):
-                if ":" in v:
-                    serialized.append(v)
-                else:
-                    raise ValueError(f"Invalid format: {v}")
-            else:
-                raise TypeError(f"Unsupported type: {type(v)}")
+    def target_cores(self, values: List[Union[str, "CoreId"]]) -> None:
+        """Record a raw ``target_cores`` override on the pending accumulator.
 
-        self._target_cores_serialized = serialized
+        Normalization (legacy migration, grain fold/unfold, device-set
+        consistency, ``global8`` coverage) is deferred to
+        :meth:`NPUTargetSpecPending.finalize`, which runs once every
+        accumulated setter override is visible. Callers never observe a
+        moment where the four target fields disagree; the finalized
+        spec is materialized on the next :attr:`_spec` read.
+        """
+        self._pending = self._pending._with(target_cores=list(values))
+        self._finalized = None
 
     @property
     def target_clusters(self) -> List["Cluster"]:
-        result = []
-        if not hasattr(self, "_target_clusters_serialized"):
-            return []
+        """Deserialize and return the target :class:`~qbruntime.Cluster` objects across every device.
 
-        for s in self._target_clusters_serialized:
-            try:
-                c_val = int(s)
-                result.append(
-                    (Cluster.Cluster0, Cluster.Cluster1)[c_val]
-                    if c_val in (0, 1)
-                    else cluster_map[c_val]
-                )
-            except Exception as e:
-                raise ValueError(
-                    f"cannot deserialize target cluster {s!r}: expected one of "
-                    f"{sorted(cluster_map)}"
-                ) from e
+        Clusters are stored internally on ``self._spec`` as canonical
+        ``"d:c"`` strings. The aggregate view includes entries from
+        every device covered by the backend and preserves the internal
+        ordering of ``self._spec.clusters``. The device prefix is
+        discarded in the return type; callers that need per-device
+        provenance should read :attr:`target_clusters_by_device` or the
+        canonical :attr:`_target_clusters_serialized` list.
+
+        Returns:
+            A list of :class:`~qbruntime.Cluster` objects representing
+            the NPU clusters selected on every device this backend covers.
+        """
+        return [cluster_enum for _dev, cluster_enum in self._iter_cluster_entries()]
+
+    @property
+    def target_cores_by_device(self) -> Dict[int, List["CoreId"]]:
+        """Return the target cores grouped by device index.
+
+        Preserves per-device provenance the aggregate :attr:`target_cores`
+        view drops. When ``self._spec.cores`` is empty, the getter mirrors
+        the aggregate fallback and expands ``target_clusters`` into their
+        4-core set on every covered device. Device indices in the returned
+        mapping preserve the order they first appear in the canonical
+        target lists; per-device value ordering matches the internal
+        order of ``self._spec.cores``.
+
+        Returns:
+            A ``dict`` mapping each covered device index to its list of
+            :class:`~qbruntime.CoreId` objects.
+        """
+        result: Dict[int, List["CoreId"]] = {}
+        for dev, _cluster_idx, core_enum, cluster_enum in self._iter_core_entries():
+            result.setdefault(dev, []).append(_make_core_id(cluster_enum, core_enum))
+        if result:
+            return result
+
+        for dev, cluster_enum in self._iter_cluster_entries():
+            bucket = result.setdefault(dev, [])
+            for core_enum in (Core.Core0, Core.Core1, Core.Core2, Core.Core3):
+                bucket.append(_make_core_id(cluster_enum, core_enum))
+        return result
+
+    @property
+    def target_clusters_by_device(self) -> Dict[int, List["Cluster"]]:
+        """Return the target clusters grouped by device index.
+
+        Preserves per-device provenance the aggregate :attr:`target_clusters`
+        view drops. Device indices in the returned mapping preserve the
+        order they first appear in ``self._spec.clusters``; per-device
+        value ordering matches the internal order of the same list.
+
+        Returns:
+            A ``dict`` mapping each covered device index to its list of
+            :class:`~qbruntime.Cluster` objects.
+        """
+        result: Dict[int, List["Cluster"]] = {}
+        for dev, cluster_enum in self._iter_cluster_entries():
+            result.setdefault(dev, []).append(cluster_enum)
         return result
 
     @target_clusters.setter
-    def target_clusters(self, values: Sequence[Union[int, "Cluster"]]):
-        serialized = []
-        for v in values:
-            if isinstance(v, Cluster):
-                serialized.append(
-                    next(
-                        index
-                        for index, cluster in enumerate(
-                            (Cluster.Cluster0, Cluster.Cluster1)
-                        )
-                        if _enum_value(cluster) == _enum_value(v)
-                    )
-                )
-            elif isinstance(v, int):
-                # Callers pass 0 and 1 meaning "first cluster", "second cluster".
-                # Preserve this public serialized form while accepting native enum
-                # values from older callers as well.
-                ordinals = [Cluster.Cluster0, Cluster.Cluster1]
-                if 0 <= v < len(ordinals):
-                    serialized.append(v)
-                elif v in cluster_map:
-                    serialized.append(v)
-                else:
-                    raise ValueError(
-                        f"cluster {v} is neither an index into "
-                        f"{[c.name for c in ordinals]} nor one of {sorted(cluster_map)}"
-                    )
-            else:
-                raise TypeError(f"Unsupported type: {type(v)}")
+    def target_clusters(self, values: List[Union[int, str, "Cluster"]]) -> None:
+        """Record a raw ``target_clusters`` override on the pending accumulator.
 
-        self._target_clusters_serialized = serialized
+        Normalization (legacy migration, grain fold/unfold, device-set
+        consistency, ``global8`` coverage) is deferred to
+        :meth:`NPUTargetSpecPending.finalize`, which runs once every
+        accumulated setter override is visible.
+        """
+        self._pending = self._pending._with(target_clusters=list(values))
+        self._finalized = None
 
     def to_dict(self, prefix="") -> Dict[str, Any]:
+        """Serializes the backend configuration to a flat dictionary.
+
+        The canonical fully-qualified ``target_cores`` or ``target_clusters``
+        list is passed through unchanged. Config-layer normalization
+        (:meth:`NPUTargetSpec.from_kwargs`) is trusted to have already
+        rewritten legacy inputs, so this method neither inspects nor
+        rewrites the serialized entries.
+
+        When canonical target strings are set, ``dev_no`` is derived from
+        their device prefixes so the emitted dict round-trips through
+        :meth:`NPUTargetSpec.from_kwargs` — the device-set consistency
+        check requires ``dev_no`` and the target device set to agree once
+        both are explicit. A single device collapses to an int; multiple
+        devices emit a sorted list. When no targets are set (e.g. early
+        construction before the config layer has expanded ``dev_no``
+        sugar), the stored ``dev_no`` is passed through as-is.
+
+        Args:
+            prefix: Optional string to prepend to every key, useful when
+                merging this configuration into a larger dictionary.
+
+        Returns:
+            A flat dictionary containing the serialized backend parameters.
+        """
         p = prefix
-        result = {
-            "name_or_path": self.name_or_path,
+        result: Dict[str, Any] = {
+            f"{p}name_or_path": self.name_or_path,
             f"{p}mxq_path": self.mxq_path,
-            f"{p}dev_no": self.dev_no,
+            f"{p}dev_no": self._spec.dev_no_for_serialization(),
+            f"{p}max_batch_size": self.max_batch_size,
             f"{p}core_mode": self.core_mode,
+            f"{p}target_device": self.target_device,
             f"{p}revision": self.revision,
             f"{p}commit_hash": self._commit_hash,
-            f"{p}target_device": self.target_device,
         }
 
         if self.core_mode == "single":
-            result[f"{p}target_cores"] = self._target_cores_serialized
+            result[f"{p}target_cores"] = list(self._spec.cores)
         else:
-            result[f"{p}target_clusters"] = self._target_clusters_serialized
+            result[f"{p}target_clusters"] = list(self._spec.clusters)
 
         return result
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any], prefix: str = "") -> "MobilintNPUBackend":
-        """Rebuilds a backend from a flat config dict.
+        """Constructs a :class:`MobilintNPUBackend` from a configuration dictionary.
 
-        Called as `MobilintNPUBackend.from_dict(...)`, `cls` is the base and
-        `__new__` picks the subclass from `target_device`. Called on a subclass,
-        a serialized board supported by that subclass is retained; a board for a
-        different backend falls back to the subclass default.
+        Trusts the config layer (:meth:`NPUTargetSpec.from_kwargs`) to have
+        already rewritten ``target_cores`` / ``target_clusters`` entries
+        into the canonical fully-qualified form. Keys are consumed from
+        ``data`` and the instance is created with the extracted values.
+        A warning is logged if both ``target_cores`` and ``target_clusters``
+        keys are present, as only one is used depending on ``core_mode``.
+
+        Args:
+            data: A (possibly prefixed) flat dictionary produced by
+                :meth:`to_dict` or a compatible configuration source.
+                Keys are *popped* from this dictionary in place.
+            prefix: The prefix that was used when the dictionary was
+                serialized (must match the prefix used in :meth:`to_dict`).
+
+        Returns:
+            A new :class:`MobilintNPUBackend` instance configured from
+            ``data``.
         """
-        p = prefix
         data = dict(data)
-        if cls is not MobilintNPUBackend:
-            serialized_target_device = data.get(f"{prefix}target_device")
-            if serialized_target_device is None:
-                data[f"{prefix}target_device"] = cls.default_target_device
-            else:
-                target_device = normalize_target_device(serialized_target_device)
-                data[f"{prefix}target_device"] = (
-                    target_device
-                    if target_device in cls.supported_target_devices
-                    else cls.default_target_device
-                )
+        p = prefix
         if f"{p}target_cores" in data.keys() and f"{p}target_clusters" in data.keys():
-            logger.warning(f"{p}target_cores and {p}target_clusters are both set!")
+            logger.warning("%starget_cores and %starget_clusters are both set!", p, p)
             logger.warning(
-                f"If {p}core_mode is `single`, only {p}target_cores will be used."
+                "If %score_mode is `single`, only %starget_cores will be used.", p, p
             )
             logger.warning(
-                f"If {p}core_mode is `multi`, `global4`, or `global8`, only {p}target_clusters will be used."
+                "If %score_mode is `multi`, `global4`, or `global8`, only %starget_clusters will be used.",
+                p,
+                p,
             )
 
         return cls(
-            name_or_path=data.pop("name_or_path", ""),
+            name_or_path=data.pop(f"{p}name_or_path", data.get("name_or_path", ""))
+            if p
+            else data.pop("name_or_path", ""),
             mxq_path=data.pop(f"{p}mxq_path", ""),
-            dev_no=data.pop(f"{p}dev_no", 0),
+            # ``None`` sentinel: distinguish "caller did not provide
+            # dev_no" from "caller explicitly requested dev_no=0" so
+            # :meth:`NPUTargetSpec.from_kwargs` skips its device-set
+            # consistency check when the input dict lacks the key.
+            dev_no=data.pop(f"{p}dev_no", None),
+            max_batch_size=data.pop(f"{p}max_batch_size", 1),
             core_mode=data.pop(f"{p}core_mode", "single"),
             target_cores=data.pop(f"{p}target_cores", None),
             target_clusters=data.pop(f"{p}target_clusters", None),
@@ -521,100 +1461,117 @@ class MobilintNPUBackend:
 
 
 class MobilintAriesBackend(MobilintNPUBackend):
-    """Aries: two clusters of four cores, four allocation modes plus auto."""
+    """Aries backend: supports all core modes and the two-cluster topology."""
 
-    num_of_clusters = 2
-    num_of_cores_in_cluster = 4
-    supported_core_modes = ("auto", "single", "multi", "global4", "global8")
     default_target_device = "aries-rb"
     supported_target_devices = ("aries-rb",)
 
     def _configure_core_mode(self, mc: "ModelConfig") -> None:
+        """Compatibility helper used by integrations that configure a raw ModelConfig."""
+        if self.core_mode == "global8" and len(self.target_clusters) != 2:
+            raise ValueError(
+                "global8 requires target_clusters to select both Aries clusters."
+            )
+        dev = self._unique_devs_from_targets()[0]
         if self.core_mode == "auto":
-            # What an unconfigured ModelConfig already is. Named explicitly because
-            # the previous code reached it by doing nothing under the label
-            # "single", and measured, the default is CoreMode.Auto with
-            # num_cores=0 — not single with all cores as its comment claimed.
             mc.set_auto_core_mode()
         elif self.core_mode == "single":
-            cores = self.target_cores
-            if cores:
-                mc.set_single_core_mode(core_ids=cores)
-            else:
-                # With no explicit cores, let qbruntime allocate one local core.
-                mc.set_single_core_mode(1)
+            mc.set_single_core_mode(None, self.filter_cores_for(dev))
         elif self.core_mode == "multi":
-            mc.set_multi_core_mode(self.target_clusters)
+            mc.set_multi_core_mode(self.filter_clusters_for(dev))
         elif self.core_mode == "global4":
-            mc.set_global4_core_mode(self.target_clusters)
-        elif self.core_mode == "global8":
-            clusters = self.target_clusters
-            expected_clusters = {
-                _enum_value(Cluster.Cluster0),
-                _enum_value(Cluster.Cluster1),
-            }
-            if (
-                len(clusters) != len(expected_clusters)
-                or {_enum_value(cluster) for cluster in clusters} != expected_clusters
-            ):
-                raise ValueError(
-                    "global8 requires target_clusters to select both Aries clusters."
-                )
+            mc.set_global4_core_mode(self.filter_clusters_for(dev))
+        else:
             mc.set_global8_core_mode()
-        else:  # unreachable: __init__ validates against supported_core_modes
-            raise ValueError(f"unhandled core_mode {self.core_mode!r}")
 
 
 class MobilintRegulusBackend(MobilintNPUBackend):
-    """Regulus: one core, single only.
+    """Regulus backend: validates its one-core, single/auto-only topology."""
 
-    Measured on a board rather than inferred: `global4` is rejected by qbruntime
-    and `global8` fails Model::create with StatusCode(16), while `auto` and
-    `single` both run. Cluster arguments have nothing to address, so they are
-    refused instead of ignored — ignoring them would let a caller believe an
-    allocation happened.
-    """
-
-    num_of_clusters = 1
-    num_of_cores_in_cluster = 1
-    supported_core_modes = ("auto", "single")
     default_target_device = "regulus-ra"
     supported_target_devices = ("regulus-ra", "regulus-rb")
+    num_of_clusters = 1
+    num_of_cores_in_cluster = 1
 
-    def __init__(self, *args, **kwargs):
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        core_mode = kwargs.get("core_mode", args[2] if len(args) > 2 else "single")
+        raw_target_cores = kwargs.get(
+            "target_cores", args[3] if len(args) > 3 else None
+        )
+        raw_target_clusters = kwargs.get(
+            "target_clusters", args[4] if len(args) > 4 else None
+        )
+        has_explicit_targets = bool(raw_target_cores) or bool(raw_target_clusters)
+        if core_mode == "auto" and raw_target_cores:
+            for target in raw_target_cores:
+                if isinstance(target, str):
+                    parts = target.split(":")
+                    if len(parts) not in {2, 3} or parts[-2:] != ["0", "0"]:
+                        raise ValueError(
+                            "Regulus auto mode accepts only its sole core (0:0)."
+                        )
+                elif isinstance(target, CoreId) and (
+                    cluster_to_int(target.cluster) != 0 or core_to_int(target.core) != 0
+                ):
+                    raise ValueError(
+                        "Regulus auto mode accepts only its sole core (0:0)."
+                    )
+        if core_mode not in {"auto", "single"}:
+            raise ValueError("Regulus supports only 'auto' and 'single' core modes.")
+        dev_no = kwargs.get("dev_no", args[1] if len(args) > 1 else 0)
+        devs = (
+            list(dev_no)
+            if isinstance(dev_no, (list, tuple))
+            else [0 if dev_no is None else dev_no]
+        )
+        default_cores = [f"{int(dev)}:0:0" for dev in devs]
+        default_clusters = [f"{int(dev)}:0" for dev in devs]
+        if core_mode == "single" and len(args) > 3 and args[3] is None:
+            args = (*args[:3], default_cores, *args[4:])
+        elif (
+            core_mode == "single"
+            and kwargs.get("target_cores") is None
+            and kwargs.get("target_clusters") is None
+        ):
+            kwargs["target_cores"] = default_cores
+        elif core_mode == "auto" and not has_explicit_targets:
+            # The generic auto-mode defaults describe Aries' two clusters.
+            # Preserve target-free intent while serializing Regulus' sole
+            # cluster so a round trip stays on the Regulus topology.
+            if len(args) > 4 and not args[4]:
+                args = (*args[:4], default_clusters, *args[5:])
+            else:
+                kwargs["target_clusters"] = default_clusters
         super().__init__(*args, **kwargs)
+        if self.core_mode == "auto":
+            if has_explicit_targets and any(
+                cluster.split(":", 1)[1] != "0" for cluster in self._spec.clusters
+            ):
+                raise ValueError(
+                    "Regulus auto mode accepts targets only for its sole core/cluster (0:0)."
+                )
+            return
         if self.target_clusters:
             raise ValueError(
-                "target_clusters is meaningless on regulus, which has a single "
-                f"core: got {self._target_clusters_serialized}. Remove it, or use "
-                "target_device='aries-rb'."
+                "target_clusters is meaningless on regulus; use its sole core (0:0)."
             )
-        cores = self.target_cores
-        expected_cluster = _enum_value(Cluster.Cluster0)
-        expected_core = _enum_value(Core.Core0)
-        if len(cores) > 1 or any(
-            _enum_value(core.cluster) != expected_cluster
-            or _enum_value(core.core) != expected_core
-            for core in cores
-        ):
+        expected_cores = {f"{dev}:0:0" for dev in self._spec.unique_devices()}
+        if set(self._spec.cores) != expected_cores:
             raise ValueError(
                 "target_cores on regulus may select only its sole core (0:0)."
             )
 
-    def _configure_core_mode(self, mc: "ModelConfig") -> None:
+    def _make_slot_config(self, dev: int) -> "ModelConfig":
+        mc = ModelConfig()
         if self.core_mode == "auto":
             mc.set_auto_core_mode()
+        elif self.core_mode == "single":
+            mc.set_single_core_mode(None, self.filter_cores_for(dev))
         else:
-            cores = self.target_cores
-            if cores:
-                mc.set_single_core_mode(core_ids=cores)
-            else:
-                mc.set_single_core_mode(1)
+            raise ValueError("Regulus supports only 'auto' and 'single' core modes.")
+        return mc
 
 
-#: target_device -> backend class. A mapping rather than a chain of ifs so that
-#: adding a product is one entry and an unknown one is an error naming the
-#: choices, instead of silently behaving like Aries.
 BACKEND_CLASSES = {
     "aries-rb": MobilintAriesBackend,
     "regulus-ra": MobilintRegulusBackend,
@@ -623,11 +1580,5 @@ BACKEND_CLASSES = {
 
 
 def backend_class_for(target_device: str):
-    normalized_target_device = normalize_target_device(target_device)
-    try:
-        return BACKEND_CLASSES[normalized_target_device]
-    except KeyError:
-        raise ValueError(
-            f"unknown target_device {target_device!r}; "
-            f"expected one of {', '.join(sorted(BACKEND_CLASSES))}"
-        ) from None
+    """Return the backend implementation for a normalized board identifier."""
+    return BACKEND_CLASSES[normalize_target_device(target_device)]
