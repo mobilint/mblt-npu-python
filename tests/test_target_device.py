@@ -370,3 +370,9 @@ def test_regulus_auto_empty_targets_are_treated_as_target_free() -> None:
     restored = MobilintNPUBackend.from_dict(backend.to_dict())
     assert isinstance(restored, MobilintRegulusBackend)
     assert restored.to_dict()["target_clusters"] == ["0:0"]
+
+
+def test_regulus_auto_positional_empty_cluster_targets_are_canonicalized() -> None:
+    backend = MobilintRegulusBackend("", 0, "auto", None, [])
+
+    assert backend.to_dict()["target_clusters"] == ["0:0"]

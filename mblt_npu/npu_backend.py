@@ -1538,7 +1538,7 @@ class MobilintRegulusBackend(MobilintNPUBackend):
             # The generic auto-mode defaults describe Aries' two clusters.
             # Preserve target-free intent while serializing Regulus' sole
             # cluster so a round trip stays on the Regulus topology.
-            if len(args) > 4 and args[4] is None:
+            if len(args) > 4 and not args[4]:
                 args = (*args[:4], default_clusters, *args[5:])
             else:
                 kwargs["target_clusters"] = default_clusters
