@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 from pathlib import Path
 from typing import Any, cast
 
@@ -9,6 +10,7 @@ import pytest
 
 from mblt_npu import MobilintAriesBackend, MobilintNPUBackend, MobilintRegulusBackend
 import mblt_npu.npu_backend as npu_backend
+from mblt_npu.npu_target import _UNSET
 
 
 @pytest.mark.parametrize(
@@ -29,6 +31,40 @@ def test_target_device_selects_the_product_backend(
     assert isinstance(backend, backend_class)
     assert backend.target_device == target_device
     assert backend.to_dict()["target_device"] == target_device
+
+
+def test_unset_sentinel_survives_deepcopy() -> None:
+    """Keep the ``_UNSET`` sentinel's identity across ``copy.deepcopy``.
+
+    ``transformers.PretrainedConfig.to_dict()`` runs ``copy.deepcopy(self.__dict__)``
+    on every config it serializes, including nested sub-configs whose
+    ``npu_backend`` still holds unresolved ``_UNSET`` slots. A bare ``object()``
+    sentinel would be reconstructed as a distinct instance there, so every
+    ``is not _UNSET`` override check on the copy would wrongly report the
+    field as overridden.
+    """
+
+    assert copy.deepcopy(_UNSET) is _UNSET
+    assert copy.copy(_UNSET) is _UNSET
+
+
+def test_backend_survives_deepcopy_before_finalization() -> None:
+    """Finalize identically after a deepcopy taken before the next ``_spec`` read.
+
+    Reproduces the HF ``PretrainedConfig.to_dict()`` path: overriding one field
+    (``target_clusters``) invalidates ``_finalized`` without touching the other
+    fields' still-``_UNSET`` raw slots. Deep-copying the backend in that state
+    (as upstream does for nested sub-configs, before their own ``to_dict()``
+    ever ran) must not corrupt those slots when the copy is finalized.
+    """
+
+    backend = MobilintAriesBackend()
+    backend.target_clusters = [0, 1]
+    assert backend._finalized is None
+
+    copied = copy.deepcopy(backend)
+
+    assert copied.to_dict() == backend.to_dict()
 
 
 def test_default_target_device_is_aries_rb() -> None:

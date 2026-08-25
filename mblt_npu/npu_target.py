@@ -52,11 +52,32 @@ from .core_mode import CoreMode, normalize_core_mode
 # Default device index for ``dev_no`` when the caller does not pin one.
 _DEFAULT_DEV_NO: int = 0
 
+
 # Sentinel used to distinguish "field not overridden this session" from
 # "field explicitly set to None/empty". Kept module-private and reused by
 # both :class:`NPUTargetSpec` (single-call ``_with`` shim) and
 # :class:`NPUTargetSpecPending` (accumulator).
-_UNSET: Any = object()
+#
+# Identity, not equality, is what every ``raw_* is not _UNSET`` check relies
+# on. A bare ``object()`` does not survive ``copy.deepcopy`` as the same
+# instance, and upstream ``transformers.PretrainedConfig.to_dict()`` runs
+# ``copy.deepcopy(self.__dict__)`` on every config it serializes -- including
+# nested sub-configs whose ``npu_backend`` still holds a pending spec with
+# unresolved ``_UNSET`` slots. That deep-copied sentinel then fails every
+# ``is not _UNSET`` check, so callers see a bogus "overridden" field. Make the
+# sentinel copy/deepcopy to itself so its identity survives that path.
+class _UnsetType:
+    def __repr__(self) -> str:
+        return "_UNSET"
+
+    def __copy__(self) -> "_UnsetType":
+        return self
+
+    def __deepcopy__(self, memo: Dict[int, Any]) -> "_UnsetType":
+        return self
+
+
+_UNSET: Any = _UnsetType()
 
 
 cluster_map: Dict[int, "Cluster"] = {

@@ -31,7 +31,7 @@ import math
 import os
 import re
 import sys
-from typing import Any, Dict, List, Literal, Optional, Union
+from typing import Any, Dict, List, Literal, Optional, Sequence, Union
 
 from huggingface_hub import HfApi, hf_hub_download
 from huggingface_hub.errors import EntryNotFoundError
@@ -211,7 +211,7 @@ class MobilintNPUBackend:
         dev_no: Optional[Union[int, List[int]]] = None,
         core_mode: CoreMode = "single",
         target_cores: Optional[List[Union[str, "CoreId"]]] = None,
-        target_clusters: Optional[List[Union[int, str, "Cluster"]]] = None,
+        target_clusters: Optional[Sequence[Union[int, str, "Cluster"]]] = None,
         revision: Optional[str] = None,
         commit_hash: Optional[str] = None,
         target_device: Optional[str] = None,
@@ -1350,7 +1350,7 @@ class MobilintNPUBackend:
         return result
 
     @target_clusters.setter
-    def target_clusters(self, values: List[Union[int, str, "Cluster"]]) -> None:
+    def target_clusters(self, values: Sequence[Union[int, str, "Cluster"]]) -> None:
         """Record a raw ``target_clusters`` override on the pending accumulator.
 
         Normalization (legacy migration, grain fold/unfold, device-set
