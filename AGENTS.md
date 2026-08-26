@@ -48,7 +48,9 @@ aligned with that floor before using newer language syntax or standard-library A
 
 ## Documentation Synchronization
 
+`.claude/skills/mblt-npu/SKILL.md` is a symlink to `.agents/skills/mblt-npu/SKILL.md`; there is
+one skill file to edit, not two.
+
 For a significant package change—public API, backend contract, supported board,
 runtime dependency, artifact-resolution behavior, or package structure—update
-this guide, `.agents/skills/mblt-npu/SKILL.md`, the Claude entry point when its
-workflow changes, and the relevant README in the same change.
+this guide, `.agents/skills/mblt-npu/SKILL.md`, and the relevant README in the same change.
