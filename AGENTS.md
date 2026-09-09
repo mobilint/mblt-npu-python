@@ -32,6 +32,12 @@ aligned with that floor before using newer language syntax or standard-library A
   board identifiers are `aries-rb`, `regulus-ra`, `regulus-rb`, `regulus-ra-usb`,
   and `regulus-rb-usb`. The board name is passed as the first argument to
   `qbruntime.Accelerator`, so `mobilint-qb-runtime>=1.4.0` is required.
+- `dev_no` sugar expansion in `NPUTargetSpec.from_kwargs` /
+  `NPUTargetSpecPending.finalize` is board-aware: Aries expands to its 2×4
+  grid, every Regulus variant expands to its sole `d:0:0` core. Callers that
+  supply only `target_device` from a config load must produce a spec the
+  concrete backend accepts. Preserve this by threading `target_device`
+  through any new spec entry point rather than hardcoding a topology.
 - Keep core-mode validation board-specific. Do not let an unsupported mode reach
   the native runtime when it can be rejected clearly in Python.
 - Keep Hub artifact lookup deterministic. Callers supply the resolved artifact

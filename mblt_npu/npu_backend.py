@@ -312,9 +312,14 @@ class MobilintNPUBackend:
             spec_kwargs["target_cores"] = list(target_cores)
         if target_clusters is not None:
             spec_kwargs["target_clusters"] = list(target_clusters)
+        # Config-layer normalization reads ``target_device`` directly from
+        # ``spec_kwargs``. Setter-chain normalization runs later without
+        # target_device in scope, so seed it on the pending here.
+        spec_kwargs["target_device"] = self.target_device
         initial_spec = NPUTargetSpec.from_kwargs(spec_kwargs)
         self._pending: NPUTargetSpecPending = NPUTargetSpecPending(
-            baseline=initial_spec
+            baseline=initial_spec,
+            target_device=self.target_device,
         )
         self._finalized: Optional[NPUTargetSpec] = initial_spec
 
@@ -349,7 +354,11 @@ class MobilintNPUBackend:
             self._finalized = self._pending.finalize()
             # Close the current override epoch: the next setter chain
             # accumulates on a fresh baseline with all intent flags cleared.
-            self._pending = NPUTargetSpecPending.from_baseline(self._finalized)
+            # Carry ``target_device`` forward so a later setter chain that
+            # re-expands ``dev_no`` sugar still sees the backend's board.
+            self._pending = NPUTargetSpecPending.from_baseline(
+                self._finalized, target_device=self.target_device
+            )
         return self._finalized
 
     # ---- Target-topology accessors ------------------------------------------

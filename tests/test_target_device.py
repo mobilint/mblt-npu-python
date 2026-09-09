@@ -10,7 +10,7 @@ import pytest
 
 from mblt_npu import MobilintAriesBackend, MobilintNPUBackend, MobilintRegulusBackend
 import mblt_npu.npu_backend as npu_backend
-from mblt_npu.npu_target import _UNSET
+from mblt_npu.npu_target import _UNSET, NPUTargetSpec
 
 
 @pytest.mark.parametrize(
@@ -417,6 +417,79 @@ def test_regulus_auto_positional_empty_cluster_targets_are_canonicalized() -> No
     backend = MobilintRegulusBackend("", 0, "auto", None, [])
 
     assert backend.to_dict()["target_clusters"] == ["0:0"]
+
+
+@pytest.mark.parametrize(
+    "target_device",
+    ["regulus-ra", "regulus-rb", "regulus-ra-usb", "regulus-rb-usb"],
+)
+def test_regulus_dev_no_sugar_expands_to_single_core(target_device: str) -> None:
+    """Expand Regulus ``dev_no`` sugar to its one-core topology, not Aries's grid.
+
+    Without target-device-aware sugar expansion, a Regulus config that only
+    names ``target_device`` receives Aries's 2 clusters × 4 cores default
+    and is then rejected by :class:`MobilintRegulusBackend`'s topology check.
+    Every Regulus board (PCIe and USB) must produce a single ``d:0:0`` core.
+    """
+
+    backend = MobilintNPUBackend(target_device=target_device)
+
+    assert isinstance(backend, MobilintRegulusBackend)
+    assert backend.to_dict()["target_cores"] == ["0:0:0"]
+
+
+def test_regulus_dev_no_sugar_respects_device_list() -> None:
+    """Expand Regulus ``dev_no=[0, 1]`` sugar to one core per named device."""
+
+    backend = MobilintNPUBackend(target_device="regulus-rb-usb", dev_no=[0, 1])
+
+    assert set(backend.to_dict()["target_cores"]) == {"0:0:0", "1:0:0"}
+
+
+@pytest.mark.parametrize(
+    "target_device",
+    ["regulus-ra", "regulus-rb", "regulus-ra-usb", "regulus-rb-usb"],
+)
+def test_from_kwargs_sugar_uses_regulus_topology(target_device: str) -> None:
+    """Populate ``dev_no`` sugar with Regulus topology at the config layer.
+
+    Direct :meth:`NPUTargetSpec.from_kwargs` exercises the sugar-expansion
+    branch that Model Zoo hits before the concrete backend __init__ can
+    populate its own single-core default: when the config layer sees only
+    ``target_device`` (no ``target_cores`` / ``target_clusters``), the spec
+    must emit ``["0:0:0"]`` for every Regulus board so a subsequent
+    :class:`MobilintRegulusBackend` construction accepts the pre-populated
+    grain.
+    """
+
+    spec = NPUTargetSpec.from_kwargs(
+        {"target_device": target_device, "core_mode": "single"}
+    )
+
+    assert list(spec.cores) == ["0:0:0"]
+
+
+def test_from_kwargs_sugar_uses_aries_topology_by_default() -> None:
+    """Fall back to Aries 2×4 sugar when no ``target_device`` is declared.
+
+    Callers with legacy configs that never named a board must keep receiving
+    the historical 8-core Aries default; :func:`_topology_for_target` treats
+    ``None`` and any non-Regulus string as Aries.
+    """
+
+    spec = NPUTargetSpec.from_kwargs({"core_mode": "single"})
+
+    assert len(spec.cores) == 8
+    assert list(spec.cores) == [
+        "0:0:0",
+        "0:0:1",
+        "0:0:2",
+        "0:0:3",
+        "0:1:0",
+        "0:1:1",
+        "0:1:2",
+        "0:1:3",
+    ]
 
 
 @pytest.mark.parametrize(
