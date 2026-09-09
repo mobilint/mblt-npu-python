@@ -469,6 +469,32 @@ def test_from_kwargs_sugar_uses_regulus_topology(target_device: str) -> None:
     assert list(spec.cores) == ["0:0:0"]
 
 
+@pytest.mark.parametrize(
+    "target_device",
+    ["regulus-ra", "regulus-rb", "regulus-ra-usb", "regulus-rb-usb"],
+)
+def test_spec_with_override_preserves_regulus_topology(target_device: str) -> None:
+    """Keep a Regulus spec's board identity across a derived ``_with`` override.
+
+    Regression for the case where ``NPUTargetSpec.from_kwargs`` set
+    ``target_device`` only on the fresh pending and lost it on the returned
+    spec. A follow-up ``spec._with(dev_no=...)`` then created a new pending
+    with ``target_device=None``, and the sugar re-expansion produced Aries's
+    2×4 grid, which :class:`MobilintRegulusBackend` would then reject for
+    referencing cores its single-cluster hardware does not have.
+    """
+
+    root = NPUTargetSpec.from_kwargs(
+        {"target_device": target_device, "core_mode": "single"}
+    )
+    assert root.target_device == target_device
+
+    derived = root._with(dev_no=1)
+
+    assert derived.target_device == target_device
+    assert list(derived.cores) == ["1:0:0"]
+
+
 def test_from_kwargs_sugar_uses_aries_topology_by_default() -> None:
     """Fall back to Aries 2×4 sugar when no ``target_device`` is declared.
 

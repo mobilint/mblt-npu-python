@@ -501,6 +501,16 @@ class NPUTargetSpec:
     _pending: Optional["NPUTargetSpecPending"] = field(
         default=None, compare=False, hash=False, repr=False
     )
+    # Board identifier carried alongside the canonical fields so a subsequent
+    # :meth:`_with` (or a fresh :class:`NPUTargetSpecPending` derived from
+    # this spec) still knows which topology to use when ``dev_no`` sugar has
+    # to re-expand. Excluded from equality/hash/repr because it is not part
+    # of the canonical ``(dev_no, core_mode, cores, clusters)`` identity —
+    # two Aries specs with identical grain must still compare equal even if
+    # only one of them recorded ``target_device``.
+    target_device: Optional[str] = field(
+        default=None, compare=False, hash=False, repr=False
+    )
 
     @property
     def _dev_no_overridden(self) -> bool:
@@ -617,6 +627,7 @@ class NPUTargetSpec:
             core_mode=core_mode,
             cores=tuple(cores),
             clusters=tuple(clusters),
+            target_device=target_device,
         )
 
     def _with(
@@ -657,7 +668,10 @@ class NPUTargetSpec:
                 :meth:`NPUTargetSpecPending.finalize`.
         """
         if self._pending is None:
-            base_pending = NPUTargetSpecPending(baseline=replace(self, _pending=None))
+            base_pending = NPUTargetSpecPending(
+                baseline=replace(self, _pending=None),
+                target_device=self.target_device,
+            )
         else:
             base_pending = self._pending
         new_pending = base_pending._with(
@@ -881,16 +895,19 @@ class NPUTargetSpecPending:
                 override epoch.
             target_device: Board identifier attached to the fresh pending so
                 :meth:`finalize` picks the right ``dev_no`` sugar topology.
-                Callers are expected to forward the backend's current
-                ``target_device`` so the fresh override epoch sees the same
-                board as the previous one.
+                Defaults to ``spec.target_device`` so callers that omit it
+                (or specs constructed outside the backend) still keep their
+                board; the backend's explicit override wins when provided.
 
         Returns:
             A new :class:`NPUTargetSpecPending` whose baseline is ``spec``
             (with any prior ``_pending`` history stripped) and whose intent
             slots are all :data:`_UNSET`.
         """
-        return cls(baseline=replace(spec, _pending=None), target_device=target_device)
+        return cls(
+            baseline=replace(spec, _pending=None),
+            target_device=target_device if target_device is not None else spec.target_device,
+        )
 
     def _with(
         self,
@@ -1046,6 +1063,7 @@ class NPUTargetSpecPending:
             cores=tuple(cores),
             clusters=tuple(clusters),
             _pending=self,
+            target_device=self.target_device,
         )
 
 
