@@ -28,9 +28,10 @@ from mblt_npu.npu_backend import (
 
 
 class _FakeAccelerator:
-    """Records the device number an accelerator was opened for."""
+    """Records the target device name and device number an accelerator was opened for."""
 
-    def __init__(self, dev_no: int) -> None:
+    def __init__(self, target_device: str, dev_no: int) -> None:
+        self.target_device = target_device
         self.dev_no = int(dev_no)
 
 

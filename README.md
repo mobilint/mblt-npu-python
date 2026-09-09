@@ -56,9 +56,11 @@ finally:
 
 `MobilintNPUBackend` selects the appropriate implementation from
 `target_device` (default: `"aries-rb"`). `"aries-rb"` selects
-`MobilintAriesBackend`; `"regulus-ra"` and `"regulus-rb"` select
-`MobilintRegulusBackend`. The former generic values `"aries"` and `"regulus"`
-remain accepted when loading older configurations.
+`MobilintAriesBackend`; `"regulus-ra"`, `"regulus-rb"`, `"regulus-ra-usb"`,
+and `"regulus-rb-usb"` select `MobilintRegulusBackend`. The former generic
+values `"aries"` and `"regulus"` remain accepted when loading older
+configurations. The board name is forwarded to `qbruntime.Accelerator` so the
+runtime opens the matching device (requires `mobilint-qb-runtime>=1.4.0`).
 `backend_class_for()` and `BACKEND_CLASSES` are available for integrations that
 need to inspect the supported targets.
 

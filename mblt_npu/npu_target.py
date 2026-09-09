@@ -131,6 +131,33 @@ _VALID_CLUSTER_INDICES: frozenset = frozenset(cluster_map.keys())
 _VALID_CORE_INDICES: frozenset = frozenset(core_map.keys())
 
 
+def _topology_for_target(target_device: Optional[str]) -> tuple[int, int]:
+    """Return ``(num_clusters, num_cores_per_cluster)`` for a board identifier.
+
+    Consumed by :func:`_resolve_targets` when expanding ``dev_no`` sugar into
+    a default target-core / target-cluster list: without a board-appropriate
+    topology, a Regulus config that names only ``target_device`` would be
+    populated with Aries's 2×4 grid and then rejected by
+    :class:`MobilintRegulusBackend` for referencing cores its single-cluster
+    hardware does not have.
+
+    Args:
+        target_device: The board identifier from the caller's config
+            (``"aries-rb"``, ``"regulus-rb-usb"``, legacy ``"aries"`` /
+            ``"regulus"``, ...), or ``None`` when the caller has not
+            declared one. Case-insensitive.
+
+    Returns:
+        ``(2, 4)`` for Aries (and the historical unspecified default so
+        callers with legacy configs keep the same sugar expansion); ``(1, 1)``
+        for every Regulus variant (RA / RB / RA-USB / RB-USB, the ``regulus``
+        family alias, and any future ``regulus-*`` addition).
+    """
+    if target_device and target_device.lower().startswith("regulus"):
+        return (1, 1)
+    return (2, 4)
+
+
 def _check_cluster_core_indices(c_val: int, k_val: int, entry: Any) -> None:
     """Raise ``ValueError`` when ``c_val`` / ``k_val`` fall outside the Aries2 topology."""
     if (
@@ -474,6 +501,16 @@ class NPUTargetSpec:
     _pending: Optional["NPUTargetSpecPending"] = field(
         default=None, compare=False, hash=False, repr=False
     )
+    # Board identifier carried alongside the canonical fields so a subsequent
+    # :meth:`_with` (or a fresh :class:`NPUTargetSpecPending` derived from
+    # this spec) still knows which topology to use when ``dev_no`` sugar has
+    # to re-expand. Excluded from equality/hash/repr because it is not part
+    # of the canonical ``(dev_no, core_mode, cores, clusters)`` identity —
+    # two Aries specs with identical grain must still compare equal even if
+    # only one of them recorded ``target_device``.
+    target_device: Optional[str] = field(
+        default=None, compare=False, hash=False, repr=False
+    )
 
     @property
     def _dev_no_overridden(self) -> bool:
@@ -539,6 +576,7 @@ class NPUTargetSpec:
         dev_no_key = f"{prefix}dev_no"
         cores_key = f"{prefix}target_cores"
         clusters_key = f"{prefix}target_clusters"
+        target_device_key = f"{prefix}target_device"
 
         core_mode = normalize_core_mode(kwargs.get(core_mode_key, "single"))
         dev_no = _dedup_dev_no(kwargs.get(dev_no_key, _DEFAULT_DEV_NO))
@@ -546,6 +584,7 @@ class NPUTargetSpec:
         dev_list = _normalize_dev_list(dev_no)
         fallback_dev = dev_list[0]
         dev_no_given = dev_no_key in kwargs
+        target_device = kwargs.get(target_device_key)
 
         raw_cores = kwargs.get(cores_key)
         raw_clusters = kwargs.get(clusters_key)
@@ -558,6 +597,7 @@ class NPUTargetSpec:
             dev_no_given=dev_no_given,
             raw_cores=list(raw_cores) if raw_cores else [],
             raw_clusters=list(raw_clusters) if raw_clusters else [],
+            target_device=target_device,
         )
 
         # Mutate the caller's ``kwargs`` dict in place for downstream code
@@ -587,6 +627,7 @@ class NPUTargetSpec:
             core_mode=core_mode,
             cores=tuple(cores),
             clusters=tuple(clusters),
+            target_device=target_device,
         )
 
     def _with(
@@ -627,7 +668,10 @@ class NPUTargetSpec:
                 :meth:`NPUTargetSpecPending.finalize`.
         """
         if self._pending is None:
-            base_pending = NPUTargetSpecPending(baseline=replace(self, _pending=None))
+            base_pending = NPUTargetSpecPending(
+                baseline=replace(self, _pending=None),
+                target_device=self.target_device,
+            )
         else:
             base_pending = self._pending
         new_pending = base_pending._with(
@@ -684,6 +728,7 @@ def _resolve_targets(
     dev_no_given: bool,
     raw_cores: List[Any],
     raw_clusters: List[Any],
+    target_device: Optional[str] = None,
 ) -> tuple[List[str], List[str]]:
     """Canonicalize a ``(dev_no, core_mode, cores, clusters)`` payload.
 
@@ -721,11 +766,24 @@ def _resolve_targets(
     )
 
     if not cores and not clusters:
-        # ``dev_no`` sugar expansion when both target lists are absent.
+        # ``dev_no`` sugar expansion when both target lists are absent. The
+        # topology is board-dependent: Aries exposes 2 clusters × 4 cores per
+        # device, Regulus exposes 1 cluster × 1 core. Without threading
+        # ``target_device`` here, a Regulus config that only names
+        # ``target_device`` receives Aries's 8-core grid and later fails
+        # :class:`MobilintRegulusBackend`'s topology check.
+        num_clusters, num_cores = _topology_for_target(target_device)
         if core_mode == "single":
-            cores = [f"{d}:{c}:{k}" for d in dev_list for c in (0, 1) for k in range(4)]
+            cores = [
+                f"{d}:{c}:{k}"
+                for d in dev_list
+                for c in range(num_clusters)
+                for k in range(num_cores)
+            ]
         else:
-            clusters = [f"{d}:{c}" for d in dev_list for c in (0, 1)]
+            clusters = [
+                f"{d}:{c}" for d in dev_list for c in range(num_clusters)
+            ]
     else:
         # Grain unification per core_mode.
         if core_mode == "single":
@@ -797,6 +855,13 @@ class NPUTargetSpecPending:
             strings, or canonical ``"d:c:k"`` strings), or :data:`_UNSET`.
         raw_clusters: The caller's raw ``target_clusters`` override, or
             :data:`_UNSET`.
+        target_device: Board identifier carried alongside the override
+            history so :meth:`finalize` can pick the right ``dev_no`` sugar
+            topology (Aries 2×4 vs Regulus 1×1). Attached by the backend at
+            init time (and preserved across chained :meth:`_with` /
+            :meth:`from_baseline` calls) because the spec-level normalization
+            layer sees target_device only at the config-load entry point;
+            per-field setter chains would otherwise lose it.
     """
 
     baseline: NPUTargetSpec
@@ -804,9 +869,15 @@ class NPUTargetSpecPending:
     raw_core_mode: Any = _UNSET
     raw_cores: Any = _UNSET
     raw_clusters: Any = _UNSET
+    target_device: Optional[str] = None
 
     @classmethod
-    def from_baseline(cls, spec: NPUTargetSpec) -> "NPUTargetSpecPending":
+    def from_baseline(
+        cls,
+        spec: NPUTargetSpec,
+        *,
+        target_device: Optional[str] = None,
+    ) -> "NPUTargetSpecPending":
         """Return a fresh pending baseline for the next override epoch.
 
         :class:`MobilintNPUBackend` calls this immediately after materializing
@@ -822,13 +893,21 @@ class NPUTargetSpecPending:
             spec: Canonical :class:`NPUTargetSpec` to seed the fresh pending's
                 baseline with. Typically the finalized result of the previous
                 override epoch.
+            target_device: Board identifier attached to the fresh pending so
+                :meth:`finalize` picks the right ``dev_no`` sugar topology.
+                Defaults to ``spec.target_device`` so callers that omit it
+                (or specs constructed outside the backend) still keep their
+                board; the backend's explicit override wins when provided.
 
         Returns:
             A new :class:`NPUTargetSpecPending` whose baseline is ``spec``
             (with any prior ``_pending`` history stripped) and whose intent
             slots are all :data:`_UNSET`.
         """
-        return cls(baseline=replace(spec, _pending=None))
+        return cls(
+            baseline=replace(spec, _pending=None),
+            target_device=target_device if target_device is not None else spec.target_device,
+        )
 
     def _with(
         self,
@@ -962,6 +1041,7 @@ class NPUTargetSpecPending:
             dev_no_given=dev_no_overridden,
             raw_cores=raw_cores,
             raw_clusters=raw_clusters,
+            target_device=self.target_device,
         )
 
         # Resolve the effective ``dev_no`` for the returned canonical spec.
@@ -983,6 +1063,7 @@ class NPUTargetSpecPending:
             cores=tuple(cores),
             clusters=tuple(clusters),
             _pending=self,
+            target_device=self.target_device,
         )
 
 

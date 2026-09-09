@@ -22,7 +22,7 @@ from .npu_backend import (
 from .logging import log_model_details
 from .onnx_backend import ONNXBackend
 
-__version__ = "0.0.2"
+__version__ = "0.1.0"
 
 __all__ = [
     "BACKEND_CLASSES",

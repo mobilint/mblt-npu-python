@@ -15,8 +15,14 @@ description: >-
    inference, input dtype inspection, serialization, and board-selected subclasses.
    For multi-slot backends, `max_batch_size` is aggregate capacity; keep slot-zero handles writable,
    preserve `infer_slot()`, and roll back every slot after allocation or launch failure.
-3. Normalize legacy `aries`/`regulus` target values to board identifiers. Keep accepted boards and
-   core modes explicit; reject unsupported combinations before calling qbruntime.
+3. Normalize legacy `aries`/`regulus` target values to board identifiers. Accepted boards are
+   `aries-rb`, `regulus-ra`, `regulus-rb`, `regulus-ra-usb`, and `regulus-rb-usb`. Forward the
+   resolved board name to `qbruntime.Accelerator` as its first positional argument, which requires
+   `mobilint-qb-runtime>=1.4.0`. `dev_no` sugar expansion in `NPUTargetSpec.from_kwargs` /
+   `NPUTargetSpecPending.finalize` is board-aware: Aries expands to its 2×4 grid, every Regulus
+   variant expands to its sole `d:0:0` core. Thread `target_device` through any new spec entry
+   point rather than hardcoding a topology, and reject unsupported combinations before calling
+   qbruntime.
 4. Keep Vision-specific artifact folder policy out of this package. This package resolves an MXQ
    path; Vision chooses its board-specific Hub artifact path.
 5. Keep `ONNXBackend` optional and lazy. It must work with injected ONNX Runtime doubles in unit
