@@ -19,6 +19,8 @@ from mblt_npu.npu_target import _UNSET
         ("aries-rb", MobilintAriesBackend),
         ("regulus-ra", MobilintRegulusBackend),
         ("regulus-rb", MobilintRegulusBackend),
+        ("regulus-ra-usb", MobilintRegulusBackend),
+        ("regulus-rb-usb", MobilintRegulusBackend),
     ],
 )
 def test_target_device_selects_the_product_backend(
@@ -76,7 +78,10 @@ def test_default_target_device_is_aries_rb() -> None:
     assert backend.target_device == "aries-rb"
 
 
-@pytest.mark.parametrize("target_device", ["regulus-ra", "regulus-rb"])
+@pytest.mark.parametrize(
+    "target_device",
+    ["regulus-ra", "regulus-rb", "regulus-ra-usb", "regulus-rb-usb"],
+)
 def test_positional_target_device_selects_the_product_backend(
     target_device: str,
 ) -> None:
@@ -412,3 +417,46 @@ def test_regulus_auto_positional_empty_cluster_targets_are_canonicalized() -> No
     backend = MobilintRegulusBackend("", 0, "auto", None, [])
 
     assert backend.to_dict()["target_clusters"] == ["0:0"]
+
+
+@pytest.mark.parametrize(
+    "target_device",
+    ["aries-rb", "regulus-ra", "regulus-rb", "regulus-ra-usb", "regulus-rb-usb"],
+)
+def test_create_passes_target_device_to_accelerator(
+    monkeypatch: pytest.MonkeyPatch, target_device: str
+) -> None:
+    """Forward the resolved board name to ``qbruntime.Accelerator``.
+
+    ``qbruntime>=1.4`` selects the physical device from the target-device
+    string passed as the first positional argument. Regressing that call
+    would silently strand USB and Regulus workloads on the default
+    accelerator, so pin the argument shape explicitly.
+    """
+
+    captured: list[tuple[Any, ...]] = []
+
+    class _Acc:
+        def __init__(self, *args: Any) -> None:
+            captured.append(args)
+
+        def dispose(self) -> None:
+            pass
+
+    class _StopCreate(Exception):
+        pass
+
+    def _no_model(*_args: Any, **_kwargs: Any) -> None:
+        raise _StopCreate
+
+    monkeypatch.setattr(npu_backend, "Accelerator", _Acc)
+    monkeypatch.setattr(npu_backend, "Model", _no_model)
+    monkeypatch.setattr(
+        npu_backend.MobilintNPUBackend, "check_model_path", lambda self, path: path
+    )
+
+    backend = MobilintNPUBackend(mxq_path="m.mxq", target_device=target_device, dev_no=0)
+    with pytest.raises(_StopCreate):
+        backend.create()
+
+    assert captured == [(target_device, 0)]

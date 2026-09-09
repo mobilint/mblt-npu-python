@@ -29,7 +29,9 @@ aligned with that floor before using newer language syntax or standard-library A
   and preserve slot-zero compatibility handles. Keep allocation rollback and
   `infer_slot()` deterministic across all slots.
 - Normalize legacy `aries` to `aries-rb` and `regulus` to `regulus-ra`. Supported
-  board identifiers are `aries-rb`, `regulus-ra`, and `regulus-rb`.
+  board identifiers are `aries-rb`, `regulus-ra`, `regulus-rb`, `regulus-ra-usb`,
+  and `regulus-rb-usb`. The board name is passed as the first argument to
+  `qbruntime.Accelerator`, so `mobilint-qb-runtime>=1.4.0` is required.
 - Keep core-mode validation board-specific. Do not let an unsupported mode reach
   the native runtime when it can be rejected clearly in Python.
 - Keep Hub artifact lookup deterministic. Callers supply the resolved artifact

@@ -74,7 +74,13 @@ def normalize_target_device(target_device: str) -> str:
     normalized = _TARGET_DEVICE_ALIASES.get(
         target_device.lower(), target_device.lower()
     )
-    if normalized not in {"aries-rb", "regulus-ra", "regulus-rb"}:
+    if normalized not in {
+        "aries-rb",
+        "regulus-ra",
+        "regulus-rb",
+        "regulus-ra-usb",
+        "regulus-rb-usb",
+    }:
         raise ValueError(f"unknown target_device {target_device!r}")
     return normalized
 
@@ -194,7 +200,13 @@ class MobilintNPUBackend:
     num_of_cores_in_cluster = 4
 
     default_target_device = DEFAULT_TARGET_DEVICE
-    supported_target_devices = ("aries-rb", "regulus-ra", "regulus-rb")
+    supported_target_devices = (
+        "aries-rb",
+        "regulus-ra",
+        "regulus-rb",
+        "regulus-ra-usb",
+        "regulus-rb-usb",
+    )
 
     def __new__(cls, *args: Any, **kwargs: Any):
         """Select a board-specific backend while retaining the legacy constructor."""
@@ -943,7 +955,9 @@ class MobilintNPUBackend:
         if not unique_devs:
             unique_devs = [self._fallback_dev()]
 
-        self.accs = {int(d): Accelerator(int(d)) for d in unique_devs}
+        self.accs = {
+            int(d): Accelerator(self.target_device, int(d)) for d in unique_devs
+        }
         self.mxq_models = []
         self.model_dev_no = []
         self.n_models = 0
@@ -1489,7 +1503,12 @@ class MobilintRegulusBackend(MobilintNPUBackend):
     """Regulus backend: validates its one-core, single/auto-only topology."""
 
     default_target_device = "regulus-ra"
-    supported_target_devices = ("regulus-ra", "regulus-rb")
+    supported_target_devices = (
+        "regulus-ra",
+        "regulus-rb",
+        "regulus-ra-usb",
+        "regulus-rb-usb",
+    )
     num_of_clusters = 1
     num_of_cores_in_cluster = 1
 
@@ -1576,6 +1595,8 @@ BACKEND_CLASSES = {
     "aries-rb": MobilintAriesBackend,
     "regulus-ra": MobilintRegulusBackend,
     "regulus-rb": MobilintRegulusBackend,
+    "regulus-ra-usb": MobilintRegulusBackend,
+    "regulus-rb-usb": MobilintRegulusBackend,
 }
 
 
