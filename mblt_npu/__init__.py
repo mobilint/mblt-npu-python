@@ -12,6 +12,8 @@ log_model_details reads a MobilintNPUBackend's fields.
 from .npu_backend import (
     BACKEND_CLASSES,
     DEFAULT_TARGET_DEVICE,
+    MAX_BATCH_SIZE,
+    MAX_MODEL_SLOTS,
     MobilintBackendAllocError,
     MobilintAriesBackend,
     MobilintNPUBackend,
@@ -27,6 +29,8 @@ __version__ = "0.1.0"
 __all__ = [
     "BACKEND_CLASSES",
     "DEFAULT_TARGET_DEVICE",
+    "MAX_BATCH_SIZE",
+    "MAX_MODEL_SLOTS",
     "MobilintBackendAllocError",
     "MobilintAriesBackend",
     "MobilintNPUBackend",

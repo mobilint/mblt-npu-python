@@ -14,6 +14,7 @@ description: >-
 2. Preserve the `MobilintNPUBackend` compatibility contract: lifecycle methods, callable MXQ
    inference, input dtype inspection, serialization, and board-selected subclasses.
    For multi-slot backends, `max_batch_size` is aggregate capacity; keep slot-zero handles writable,
+   accept only non-boolean integers from 1 through 1024, cap each backend at 64 model slots,
    preserve `infer_slot()`, and roll back every slot after allocation or launch failure.
 3. Normalize legacy `aries`/`regulus` target values to board identifiers. Accepted boards are
    `aries-rb`, `regulus-ra`, `regulus-rb`, `regulus-ra-usb`, and `regulus-rb-usb`. Forward the

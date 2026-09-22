@@ -27,7 +27,6 @@ Backwards compatibility: for callers written against a single ``Model`` /
 """
 
 import logging
-import math
 import os
 import re
 import sys
@@ -62,7 +61,24 @@ logger = logging.getLogger(__name__)
 DEFAULT_TARGET_DEVICE = "aries-rb"
 """Default supported Mobilint NPU board."""
 
+MAX_BATCH_SIZE = 1024
+"""Largest aggregate batch capacity accepted by the public configuration API."""
+
+MAX_MODEL_SLOTS = 64
+"""Largest number of native model slots a backend instance may allocate."""
+
 _TARGET_DEVICE_ALIASES = {"aries": "aries-rb", "regulus": "regulus-ra"}
+
+
+def _validate_max_batch_size(value: object) -> int:
+    """Return a safe aggregate capacity or reject it before native allocation."""
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise TypeError("max_batch_size must be a non-boolean integer.")
+    if not 1 <= value <= MAX_BATCH_SIZE:
+        raise ValueError(
+            f"max_batch_size must be between 1 and {MAX_BATCH_SIZE}, got {value}."
+        )
+    return value
 
 
 def normalize_target_device(target_device: str) -> str:
@@ -242,9 +258,12 @@ class MobilintNPUBackend:
                 expanded into ``target_cores`` / ``target_clusters`` when
                 those lists are empty, and prepends the device prefix to
                 legacy 2-part items.
-            max_batch_size: Requested aggregate batch capacity. The backend
+            max_batch_size: Requested aggregate batch capacity in the inclusive
+                range ``1..MAX_BATCH_SIZE``. Booleans and non-integers are rejected.
+                The backend
                 launches enough slots so that ``N * K >= max_batch_size``,
-                where ``K`` is the compiled batch axis of the MXQ artifact.
+                where ``K`` is the compiled batch axis of the MXQ artifact, up
+                to ``MAX_MODEL_SLOTS`` slots.
             core_mode: Execution mode that determines how NPU cores are
                 allocated. One of ``"single"``, ``"multi"``, ``"global4"``,
                 or ``"global8"``.
@@ -278,7 +297,7 @@ class MobilintNPUBackend:
         self.revision = revision
         self._commit_hash = commit_hash
         self.mxq_path = mxq_path
-        self.max_batch_size = max(1, max_batch_size)
+        self.max_batch_size = _validate_max_batch_size(max_batch_size)
 
         # Multi-slot backing state; populated in create()/launch().
         # ``self.acc`` and ``self.mxq_model`` remain accessible as
@@ -951,15 +970,22 @@ class MobilintNPUBackend:
         user-config or artifact bug.
 
         Raises:
+            TypeError: If the current ``max_batch_size`` is not a non-boolean
+                integer.
             MobilintBackendAllocError: If any slot hits a device-memory
                 ``BadAlloc`` or the slot 0 K probe hits a ``BadAlloc``.
             QbRuntimeError: If any slot or the slot 0 K probe fails for a
                 non-alloc reason (after partial-state rollback).
-            ValueError: If ``self.core_mode`` is not one of the supported
-                values.
+            ValueError: If the current ``max_batch_size`` is outside the
+                supported range or ``self.core_mode`` is unsupported.
             AssertionError: If ``"global8"`` mode is requested but a device
                 does not cover both clusters.
         """
+        # ``max_batch_size`` remains writable for compatibility. Revalidate
+        # its current value before opening accelerators or creating slot 0 so
+        # post-construction mutation cannot bypass the public capacity bounds.
+        self.max_batch_size = _validate_max_batch_size(self.max_batch_size)
+
         unique_devs = self._unique_devs_from_targets()
         if not unique_devs:
             unique_devs = [self._fallback_dev()]
@@ -1053,9 +1079,20 @@ class MobilintNPUBackend:
                 file=sys.stderr,
             )
             raise
-        self.n_models = max(
-            1, math.ceil(self.max_batch_size / max(1, self.k_per_model))
-        )
+        # Integer ceiling avoids converting attacker-controlled integers to a
+        # float. Keep this post-probe guard even though construction validates
+        # max_batch_size: the attribute remains writable for compatibility.
+        k_per_model = max(1, self.k_per_model)
+        self.n_models = (self.max_batch_size + k_per_model - 1) // k_per_model
+        if self.n_models > MAX_MODEL_SLOTS:
+            self._dispose_all_slots()
+            self.accs = {}
+            self.n_models = 0
+            raise ValueError(
+                f"max_batch_size={self.max_batch_size} with "
+                f"k_per_model={k_per_model} requires more than the supported "
+                f"maximum of {MAX_MODEL_SLOTS} model slots."
+            )
 
         for slot_idx in range(1, self.n_models):
             d = int(unique_devs[slot_idx % len(unique_devs)])
