@@ -77,7 +77,15 @@ jobs:
 
       - name: Verify distribution artifacts
         working-directory: release
-        run: sha256sum --check SHA256SUMS
+        run: |
+          manifest_files="$(sed -n 's/^[0-9a-f]\{64\} [*]packages\/\(.*\)$/\1/p' SHA256SUMS | LC_ALL=C sort)"
+          package_entries="$(find packages -mindepth 1 -maxdepth 1 -printf '%f\n' | LC_ALL=C sort)"
+          if [ "$manifest_files" != "$package_entries" ]; then
+            echo "SHA256SUMS does not list exactly the package directory contents" >&2
+            diff --unified <(printf '%s\n' "$manifest_files") <(printf '%s\n' "$package_entries") || true
+            exit 1
+          fi
+          sha256sum --strict --check SHA256SUMS
 
       - name: Publish to TestPyPI
         uses: pypa/gh-action-pypi-publish@76f52bc884231f62b9a034ebfe128415bbaabdfc # release/v1
@@ -103,7 +111,15 @@ jobs:
 
       - name: Verify distribution artifacts
         working-directory: release
-        run: sha256sum --check SHA256SUMS
+        run: |
+          manifest_files="$(sed -n 's/^[0-9a-f]\{64\} [*]packages\/\(.*\)$/\1/p' SHA256SUMS | LC_ALL=C sort)"
+          package_entries="$(find packages -mindepth 1 -maxdepth 1 -printf '%f\n' | LC_ALL=C sort)"
+          if [ "$manifest_files" != "$package_entries" ]; then
+            echo "SHA256SUMS does not list exactly the package directory contents" >&2
+            diff --unified <(printf '%s\n' "$manifest_files") <(printf '%s\n' "$package_entries") || true
+            exit 1
+          fi
+          sha256sum --strict --check SHA256SUMS
 
       - name: Publish to PyPI
         uses: pypa/gh-action-pypi-publish@76f52bc884231f62b9a034ebfe128415bbaabdfc # release/v1
