@@ -68,6 +68,10 @@ need to inspect the supported targets.
 
 `max_batch_size` is aggregate capacity. At `create()`, the backend probes the
 compiled per-model capacity `K` and loads `ceil(max_batch_size / K)` model slots.
+For predictable resource use, `max_batch_size` must be a non-boolean integer
+from 1 through 1024, and one backend may load at most 64 model slots. If the
+probed `K` would require more slots, creation disposes slot zero and fails before
+allocating any additional slots.
 Slots are distributed round-robin over the devices named by canonical target
 strings and reuse one accelerator per device. `mxq_model` and `acc` continue to
 refer to slot zero for compatibility; concurrent callers can use

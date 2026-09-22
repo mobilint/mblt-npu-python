@@ -21,6 +21,8 @@ from qbruntime import QbRuntimeError
 
 from mblt_npu import npu_backend as npu_backend_module
 from mblt_npu.npu_backend import (
+    MAX_BATCH_SIZE,
+    MAX_MODEL_SLOTS,
     MobilintBackendAllocError,
     MobilintNPUBackend,
     _is_qbruntime_bad_alloc,
@@ -151,6 +153,43 @@ def _make_backend_at(tmp_path, **kwargs) -> MobilintNPUBackend:
     kwargs.setdefault("mxq_path", str(mxq_path))
     kwargs.setdefault("core_mode", "single")
     return MobilintNPUBackend(**kwargs)
+
+
+@pytest.mark.parametrize("value", [True, False, 1.5, "2", None])
+def test_max_batch_size_rejects_non_integer_values(value) -> None:
+    """Public construction rejects values that are not strict integers."""
+    with pytest.raises(TypeError, match="non-boolean integer"):
+        MobilintNPUBackend(max_batch_size=value)
+
+
+@pytest.mark.parametrize("value", [0, -1, MAX_BATCH_SIZE + 1])
+def test_max_batch_size_rejects_values_outside_safe_range(value: int) -> None:
+    """Public construction bounds aggregate capacity before native allocation."""
+    with pytest.raises(ValueError, match=f"between 1 and {MAX_BATCH_SIZE}"):
+        MobilintNPUBackend(max_batch_size=value)
+
+
+def test_from_dict_validates_max_batch_size() -> None:
+    """Deserialized configuration uses the same strict admission checks."""
+    with pytest.raises(TypeError, match="non-boolean integer"):
+        MobilintNPUBackend.from_dict({"max_batch_size": 2.5})
+
+
+def test_create_rejects_excessive_derived_slots_and_rolls_back(
+    tmp_path, stub_qbruntime
+) -> None:
+    """The post-probe slot cap disposes slot zero before further allocations."""
+    backend = _make_backend_at(tmp_path, max_batch_size=MAX_MODEL_SLOTS)
+    backend.max_batch_size = MAX_MODEL_SLOTS + 1
+
+    with pytest.raises(ValueError, match=f"maximum of {MAX_MODEL_SLOTS} model slots"):
+        backend.create()
+
+    assert len(stub_qbruntime.models) == 1
+    assert stub_qbruntime.models[0].disposed is True
+    assert backend.mxq_models == []
+    assert backend.accs == {}
+    assert backend.n_models == 0
 
 
 def test_backend_create_n1_single_slot_single_device(tmp_path, stub_qbruntime) -> None:

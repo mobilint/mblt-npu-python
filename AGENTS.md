@@ -26,8 +26,9 @@ aligned with that floor before using newer language syntax or standard-library A
   selection behavior.
 - `max_batch_size` is aggregate capacity: probe the compiled per-slot batch axis
   `K`, launch `ceil(max_batch_size / K)` slots, share accelerators per device,
-  and preserve slot-zero compatibility handles. Keep allocation rollback and
-  `infer_slot()` deterministic across all slots.
+  and preserve slot-zero compatibility handles. Accept only non-boolean integers
+  from 1 through 1024 and cap the derived allocation at 64 model slots. Keep
+  allocation rollback and `infer_slot()` deterministic across all slots.
 - Normalize legacy `aries` to `aries-rb` and `regulus` to `regulus-ra`. Supported
   board identifiers are `aries-rb`, `regulus-ra`, `regulus-rb`, `regulus-ra-usb`,
   and `regulus-rb-usb`. The board name is passed as the first argument to
