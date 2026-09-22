@@ -13,31 +13,51 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
-        uses: actions/checkout@v5
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           fetch-depth: 0
 
       - name: Set up Python
-        uses: actions/setup-python@v6
+        uses: actions/setup-python@42375524e23c412d93fb67b49958b491fce71c38 # v5.4.0
         with:
           python-version: '3.12'
 
       - name: Install build dependencies
-        run: |
-          python -m pip install --upgrade pip
-          python -m pip install build twine
+        run: python -m pip install --require-hashes -r .github/build-requirements.txt
 
       - name: Build package
-        run: python -m build
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          from setuptools import build_meta
+
+          Path("release/packages").mkdir(parents=True)
+          build_meta.build_sdist("release/packages")
+          build_meta.build_wheel("release/packages")
+          PY
 
       - name: Validate distributions
-        run: python -m twine check dist/*
+        run: |
+          python - <<'PY'
+          import tarfile
+          import zipfile
+          from pathlib import Path
+
+          artifacts = sorted(Path("release/packages").iterdir())
+          assert {path.suffix for path in artifacts} == {".gz", ".whl"}, artifacts
+          with tarfile.open(next(path for path in artifacts if path.suffix == ".gz")) as archive:
+              archive.getmembers()
+          with zipfile.ZipFile(next(path for path in artifacts if path.suffix == ".whl")) as archive:
+              assert archive.testzip() is None
+          PY
+          cd release
+          sha256sum --binary packages/*.tar.gz packages/*.whl > SHA256SUMS
 
       - name: Upload built distributions
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: python-package-distributions
-          path: dist/
+          path: release/
 
   publish-to-testpypi:
     name: Publish to TestPyPI 🧪
@@ -50,14 +70,19 @@ jobs:
       id-token: write
     steps:
       - name: Download distribution artifacts
-        uses: actions/download-artifact@v7
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: python-package-distributions
-          path: dist/
+          path: release/
+
+      - name: Verify distribution artifacts
+        working-directory: release
+        run: sha256sum --check SHA256SUMS
 
       - name: Publish to TestPyPI
-        uses: pypa/gh-action-pypi-publish@release/v1
+        uses: pypa/gh-action-pypi-publish@76f52bc884231f62b9a034ebfe128415bbaabdfc # release/v1
         with:
+          packages-dir: release/packages/
           repository-url: https://test.pypi.org/legacy/
 
   publish-to-pypi:
@@ -71,10 +96,16 @@ jobs:
       id-token: write
     steps:
       - name: Download distribution artifacts
-        uses: actions/download-artifact@v7
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: python-package-distributions
-          path: dist/
+          path: release/
+
+      - name: Verify distribution artifacts
+        working-directory: release
+        run: sha256sum --check SHA256SUMS
 
       - name: Publish to PyPI
-        uses: pypa/gh-action-pypi-publish@release/v1
+        uses: pypa/gh-action-pypi-publish@76f52bc884231f62b9a034ebfe128415bbaabdfc # release/v1
+        with:
+          packages-dir: release/packages/
