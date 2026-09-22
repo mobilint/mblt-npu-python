@@ -175,6 +175,28 @@ def test_from_dict_validates_max_batch_size() -> None:
         MobilintNPUBackend.from_dict({"max_batch_size": 2.5})
 
 
+@pytest.mark.parametrize(
+    ("value", "error", "message"),
+    [
+        (True, TypeError, "non-boolean integer"),
+        (0, ValueError, f"between 1 and {MAX_BATCH_SIZE}"),
+        (MAX_BATCH_SIZE + 1, ValueError, f"between 1 and {MAX_BATCH_SIZE}"),
+    ],
+)
+def test_max_batch_size_revalidates_writable_assignments(
+    tmp_path, stub_qbruntime, value, error, message
+) -> None:
+    """Compatibility writes are revalidated before any native allocation."""
+    backend = _make_backend_at(tmp_path, max_batch_size=1)
+    backend.max_batch_size = value
+
+    with pytest.raises(error, match=message):
+        backend.create()
+
+    assert stub_qbruntime.models == []
+    assert backend.accs == {}
+
+
 def test_create_rejects_excessive_derived_slots_and_rolls_back(
     tmp_path, stub_qbruntime
 ) -> None:

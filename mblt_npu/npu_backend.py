@@ -70,6 +70,17 @@ MAX_MODEL_SLOTS = 64
 _TARGET_DEVICE_ALIASES = {"aries": "aries-rb", "regulus": "regulus-ra"}
 
 
+def _validate_max_batch_size(value: object) -> int:
+    """Return a safe aggregate capacity or reject it before native allocation."""
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise TypeError("max_batch_size must be a non-boolean integer.")
+    if not 1 <= value <= MAX_BATCH_SIZE:
+        raise ValueError(
+            f"max_batch_size must be between 1 and {MAX_BATCH_SIZE}, got {value}."
+        )
+    return value
+
+
 def normalize_target_device(target_device: str) -> str:
     """Normalize a board identifier while accepting legacy product aliases."""
     if not isinstance(target_device, str):
@@ -286,14 +297,7 @@ class MobilintNPUBackend:
         self.revision = revision
         self._commit_hash = commit_hash
         self.mxq_path = mxq_path
-        if isinstance(max_batch_size, bool) or not isinstance(max_batch_size, int):
-            raise TypeError("max_batch_size must be a non-boolean integer.")
-        if not 1 <= max_batch_size <= MAX_BATCH_SIZE:
-            raise ValueError(
-                f"max_batch_size must be between 1 and {MAX_BATCH_SIZE}, "
-                f"got {max_batch_size}."
-            )
-        self.max_batch_size = max_batch_size
+        self.max_batch_size = _validate_max_batch_size(max_batch_size)
 
         # Multi-slot backing state; populated in create()/launch().
         # ``self.acc`` and ``self.mxq_model`` remain accessible as
@@ -966,15 +970,22 @@ class MobilintNPUBackend:
         user-config or artifact bug.
 
         Raises:
+            TypeError: If the current ``max_batch_size`` is not a non-boolean
+                integer.
             MobilintBackendAllocError: If any slot hits a device-memory
                 ``BadAlloc`` or the slot 0 K probe hits a ``BadAlloc``.
             QbRuntimeError: If any slot or the slot 0 K probe fails for a
                 non-alloc reason (after partial-state rollback).
-            ValueError: If ``self.core_mode`` is not one of the supported
-                values.
+            ValueError: If the current ``max_batch_size`` is outside the
+                supported range or ``self.core_mode`` is unsupported.
             AssertionError: If ``"global8"`` mode is requested but a device
                 does not cover both clusters.
         """
+        # ``max_batch_size`` remains writable for compatibility. Revalidate
+        # its current value before opening accelerators or creating slot 0 so
+        # post-construction mutation cannot bypass the public capacity bounds.
+        self.max_batch_size = _validate_max_batch_size(self.max_batch_size)
+
         unique_devs = self._unique_devs_from_targets()
         if not unique_devs:
             unique_devs = [self._fallback_dev()]
